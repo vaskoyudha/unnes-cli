@@ -11,6 +11,7 @@ mod config;
 mod data;
 mod diff;
 mod fetcher;
+mod kurikulum;
 mod output;
 mod paths;
 mod watch;
@@ -69,6 +70,8 @@ enum Cmd {
     Discover(DiscoverArgs),
     /// Stored data: list/show/history/export captured page states
     Data(DataArgs),
+    /// Kurikulum: all mata kuliah by semester (LULUS/BERJALAN/BELUM DITEMPUH)
+    Kurikulum,
     /// Print the change log.
     Changelog(ChangelogArgs),
 }
@@ -274,6 +277,7 @@ fn run(cli: Cli) -> Result<()> {
         },
         Cmd::Discover(a) => cmd_discover(&home, &profile, &a, cli.json),
         Cmd::Data(d) => cmd_data(&home, &profile, &d.cmd, cli.json),
+        Cmd::Kurikulum => cmd_kurikulum(&home, &profile, cli.json),
         Cmd::Changelog(a) => changelog_list(&home, &a, cli.json),
     }
 }
@@ -572,6 +576,108 @@ fn cmd_data(home: &UnnesHome, _profile: &str, cmd: &DataCmd, json_out: bool) -> 
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&full)?);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the student NIM: config.general.nim, else the stored biodata.
+fn resolve_nim(home: &UnnesHome) -> Option<String> {
+    if let Ok(cfg) = Config::load(home) {
+        if let Some(n) = &cfg.general.nim {
+            return Some(n.clone());
+        }
+    }
+    if let Ok(Some(entry)) = crate::data::latest(home, "biodata") {
+        for r in &entry.records {
+            let t = r.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(n) = t.strip_prefix("NIM ").map(|n| n.trim().to_string()) {
+                if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// unnes kurikulum: full curriculum grouped by semester with status
+/// categories (LULUS / BERJALAN / BELUM DITEMPUH) per mata kuliah.
+fn cmd_kurikulum(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
+    let nim = resolve_nim(home)
+        .ok_or_else(|| app_err(1, "cannot determine NIM - set [general] nim in config or run unnes watch run first (biodata)"))?;
+    let url = format!("https://duanol.unnes.ac.id/v2/prakuliah/kurikulum/get_kurikulum_mhs/{nim}.aspx");
+
+    // Fetch: plain HTTP first; if the duanol session is missing, prime it via
+    // the browser (app 23) and retry once.
+    let fetch_ok = |u: &str| -> Result<(bool, String)> {
+        let mut job = fetcher::job("get", profile);
+        job["url"] = json!(u);
+        let res = fetcher::run_job(home, profile, job)?;
+        if !res.ok {
+            let msg = res.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+            return Ok((false, msg));
+        }
+        if res.session_expired {
+            return Ok((false, "session expired".into()));
+        }
+        Ok((true, res.normalized.unwrap_or_default()))
+    };
+    let (mut ok, mut text) = fetch_ok(&url)?;
+    if !ok {
+        // prime the duanol session via a render pass (syncs cookies to jar)
+        let cfg = Config::load(home)?;
+        let page = cfg.pages.iter().find(|p| p.id == "sikadu-krs").cloned().unwrap_or_default();
+        let _ = watch::fetch_page(home, profile, &page);
+        let second = fetch_ok(&url)?;
+        ok = second.0;
+        if !ok {
+            return Err(app_err(4, "kurikulum: duanol session unavailable; run: unnes login"));
+        }
+        text = second.1;
+    }
+
+    let kursus = kurikulum::parse_curriculum(&text);
+    if kursus.is_empty() {
+        return Err(app_err(1, "kurikulum: no courses parsed - the page structure may have changed"));
+    }
+
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "nim": nim,
+            "total": kursus.len(),
+            "semester": kursus,
+        }))?);
+        return Ok(());
+    }
+
+    let mut by_sem: std::collections::BTreeMap<u32, Vec<&kurikulum::Kursus>> = Default::default();
+    let mut lulus = 0u32;
+    let mut sks_lulus = 0u32;
+    let mut sks_total = 0u32;
+    for k in &kursus {
+        by_sem.entry(k.semester).or_default().push(k);
+        sks_total += k.sks;
+        if k.kategori() == "LULUS" {
+            lulus += 1;
+            sks_lulus += k.sks;
+        }
+    }
+    println!("Kurikulum Teknik Informatika, S1 (angkatan 2024) - {} mata kuliah, {} SKS", kursus.len(), sks_total);
+    println!("Lulus: {} MK / {} SKS  |  Sisa: {} SKS", lulus, sks_lulus, sks_total - sks_lulus);
+    for (sem, list) in &by_sem {
+        let done = list.iter().filter(|k| k.kategori() == "LULUS").count();
+        let running = list.iter().filter(|k| k.kategori() == "BERJALAN").count();
+        println!();
+        println!("--- Semester {} ({}) | lulus {} | berjalan {} | belum {} ---", sem, list.len(), done, running, list.len() - done - running);
+        for k in list {
+            let mark = match k.kategori() {
+                "LULUS" => "lulus",
+                "BERJALAN" => "sedang",
+                _ => "belum",
+            };
+            let g = if k.nilai().is_empty() { String::new() } else { format!(" [{}]", k.nilai()) };
+            println!("   {:3}  {:<7} {:<42} {:>2} SKS  {}{}", k.no % 100, k.kode, k.nama, k.sks, mark, g);
         }
     }
     Ok(())

@@ -21,6 +21,7 @@ comfy-table = "7"
 rpassword = "7"
 anyhow = "1"
 rand = "0.8"
+regex = "1"
 
 [profile.release]
 lto = true

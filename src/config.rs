@@ -24,6 +24,10 @@ pub struct General {
     /// (saved profile) before failing; default true.
     #[serde(default = "default_true")]
     pub auto_relogin: bool,
+    /// Student NIM, used by the kurikulum view; falls back to the stored
+    /// biodata when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nim: Option<String>,
     pub min_interval: u64,
     pub jitter_fraction: f64,
     pub user_agent: String,
@@ -50,7 +54,7 @@ pub struct Notify {
     pub command: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Page {
     pub id: String,
     pub url: String,
@@ -93,6 +97,7 @@ impl Default for General {
             base_url: "https://apps.unnes.ac.id".to_string(),
             default_interval: 900,
             auto_relogin: true,
+            nim: None,
             min_interval: 60,
             jitter_fraction: 0.1,
             user_agent: "unnes-cli/0.1 (personal student automation; polite)".to_string(),

@@ -102,6 +102,7 @@ examples/config.example.toml (copy to ~/.config/unnes/config.toml and edit).
     unnes data show <page>      latest stored records (table/--csv/--json)
     unnes data history <page>   capture timeline of distinct states
     unnes data export <page>    full history JSON (--csv: latest state)
+    unnes kurikulum             all mata kuliah by semester: LULUS/BERJALAN/BELUM DITEMPUH
     unnes changelog [--since=... --page-id=...]
 
 Render/crawl pages in one watch pass share a single browser session (op=batch),
