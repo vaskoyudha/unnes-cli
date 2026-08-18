@@ -44,6 +44,10 @@ A TUI is explicitly out of v1.
     make install            # -> ~/.cargo/bin/unnes
     make test               # full Rust + fetcher suites
 
+The installed binary ships only the executable. The first `unnes` run from the
+repo checkout self-installs the fetch arm (dist + node_modules, ~50 MB) into
+`$UNNES_HOME/fetcher` once, after which every command works from any directory.
+
 ## Auto re-login (saved profile)
 
 The gateway session lapses roughly every 2h (server-side Laravel session).
@@ -158,5 +162,8 @@ URLs - every target is a config page.
   fetcher as a fallback.
 - Session expiry surfaces as exit code 4; re-run unnes login (SSO cannot be
   automated headlessly - that is intentional).
-- The fetcher is located via $UNNES_FETCHER, then ./fetcher/dist/index.js, then
-  <exe>/../fetcher/dist/index.js.
+- The fetcher is located via $UNNES_FETCHER, then $UNNES_HOME/fetcher/dist/index.js
+  (installed copy), then ./fetcher/dist/index.js or <exe>/../fetcher/dist/index.js.
+  When only a source tree is discoverable, it is self-installed into $UNNES_HOME
+  once, so the installed binary works from any directory (no more "cannot locate
+  fetcher" when run outside the repo).

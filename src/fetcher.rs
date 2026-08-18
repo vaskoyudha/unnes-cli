@@ -5,8 +5,9 @@
 //! stdout. Anything else on stdout is a bug; user-facing progress from the
 //! fetcher goes to stderr.
 
+use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -15,29 +16,80 @@ use serde_json::{json, Value};
 
 use crate::paths::UnnesHome;
 
-/// Script location: $UNNES_FETCHER > ./fetcher/dist/index.js > <exe>/../fetcher/dist/index.js.
-fn fetcher_script() -> Result<PathBuf> {
+/// Recursively copy a directory tree (symlinks dereferenced). Keeps the
+/// dist + node_modules layout intact so Node resolves "playwright" from the
+/// copied location too.
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// One-time self-install: copy a discoverable fetcher tree into
+/// $UNNES_HOME/fetcher, so the installed binary (cargo install ships only
+/// the executable) works from ANY directory. Idempotent.
+pub fn bootstrap_fetcher(home: &UnnesHome, source: &Path) -> Result<PathBuf> {
+    let dest = home.root.join("fetcher");
+    let script = dest.join("dist").join("index.js");
+    if script.is_file() {
+        return Ok(script);
+    }
+    eprintln!(
+        "unnes: memasang fetcher ke {} (sekali saja, ~50 MB)...",
+        dest.display()
+    );
+    copy_tree(source, &dest)?;
+    if !script.is_file() {
+        bail!("bootstrap incomplete: {} missing", script.display());
+    }
+    Ok(script)
+}
+
+/// Script location, searched in this order:
+///   1. $UNNES_FETCHER (explicit override)
+///   2. $UNNES_HOME/fetcher/dist/index.js (installed copy, works from any cwd)
+///   3. a discoverable source tree (./fetcher in the cwd, or <exe>/../fetcher)
+///      - which is self-installed into $UNNES_HOME ONCE, so the binary keeps
+///        working from any directory afterwards.
+/// When neither an installed copy nor a source tree exists, the error tells
+/// the user to run once from the repo checkout (that run performs the install).
+fn fetcher_script(home: &UnnesHome) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("UNNES_FETCHER") {
         return Ok(PathBuf::from(p));
     }
-    let cwd = std::env::current_dir().context("cannot read cwd")?;
-    let from_cwd = cwd.join("fetcher").join("dist").join("index.js");
-    if from_cwd.is_file() {
-        return Ok(from_cwd);
+    let installed = home.root.join("fetcher").join("dist").join("index.js");
+    if installed.is_file() {
+        return Ok(installed);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        let rel = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("fetcher").join("dist").join("index.js"));
-        if let Some(p) = rel {
-            if p.is_file() {
-                return Ok(p);
-            }
+    let cwd = std::env::current_dir().context("cannot read cwd")?;
+    let usable = |dir: &Path| {
+        if dir.join("dist").join("index.js").is_file() {
+            Some(dir.to_path_buf())
+        } else {
+            None
         }
+    };
+    let source = usable(&cwd.join("fetcher")).or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().and_then(|p| p.parent()).map(|p| p.join("fetcher")))
+            .and_then(|p| usable(&p))
+    });
+    if let Some(src) = source {
+        return bootstrap_fetcher(home, &src);
     }
     bail!(
-        "cannot locate fetcher/dist/index.js (set UNNES_FETCHER or run from the repo root)"
+        "cannot locate fetcher/dist/index.js - run once from the repo checkout (unnes installs it into {}) or set UNNES_FETCHER",
+        home.root.display()
     )
 }
 
@@ -101,7 +153,7 @@ pub struct BatchResult {
 
 /// Run one job against the fetcher; returns the parsed result.
 pub fn run_job(home: &UnnesHome, profile: &str, job: Value) -> Result<JobResult> {
-    let script = fetcher_script()?;
+    let script = fetcher_script(home)?;
     let mut child = Command::new("node")
         .arg(&script)
         .env("UNNES_HOME", &home.root)
@@ -167,6 +219,44 @@ mod tests {
         assert_eq!(j["profile"], "work");
         assert!(j["baseUrl"].is_string());
         let _ = &home; // keep signature documented
+    }
+
+    #[test]
+    fn copy_tree_copies_nested_layout() {
+        let tag = format!("{}-cpytree", std::process::id());
+        let src = std::env::temp_dir().join(&tag).join("src");
+        let dst = std::env::temp_dir().join(&tag).join("dst");
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
+        fs::create_dir_all(src.join("dist")).unwrap();
+        fs::create_dir_all(src.join("node_modules/pkg")).unwrap();
+        fs::write(src.join("dist/index.js"), "//x").unwrap();
+        fs::write(src.join("node_modules/pkg/readme.txt"), "hi").unwrap();
+        copy_tree(&src, &dst).unwrap();
+        assert!(dst.join("dist/index.js").is_file());
+        assert!(dst.join("node_modules/pkg/readme.txt").is_file());
+        assert_eq!(fs::read_to_string(dst.join("node_modules/pkg/readme.txt")).unwrap(), "hi");
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn bootstrap_installs_fetcher_and_is_idempotent() {
+        let tag = format!("{}-bootstrap", std::process::id());
+        let src = std::env::temp_dir().join(&tag).join("fetcher-src");
+        let home = UnnesHome { root: std::env::temp_dir().join(&tag).join("home") };
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&home.root);
+        fs::create_dir_all(src.join("dist")).unwrap();
+        fs::write(src.join("dist/index.js"), "module.exports=1").unwrap();
+        let first = bootstrap_fetcher(&home, &src).unwrap();
+        assert_eq!(first, home.root.join("fetcher").join("dist").join("index.js"));
+        assert!(first.is_file());
+        // second call: no re-copy, same path
+        let second = bootstrap_fetcher(&home, &src).unwrap();
+        assert_eq!(first, second);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&home.root);
     }
 }
 
