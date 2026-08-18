@@ -1,0 +1,22 @@
+# Rust
+/target/
+Cargo.lock.orig
+
+# Node fetcher
+/node_modules/
+/fetcher/dist/
+
+# Secrets - never commit
+credentials.env
+.unnes.env
+*.key
+*.pem
+
+# Local state when UNNES_HOME points into the repo (dev/testing)
+/storage/
+/profiles/
+changelog.jsonl
+
+# Editor/OS noise
+.DS_Store
+*.swp

@@ -1,0 +1,27 @@
+[package]
+name = "unnes-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for the UNNES student portal: session, grades, schedule, change watching"
+license = "MIT"
+
+[[bin]]
+name = "unnes"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+comfy-table = "7"
+rpassword = "7"
+anyhow = "1"
+rand = "0.8"
+
+[profile.release]
+lto = true
+strip = true
