@@ -30,7 +30,6 @@ A TUI is explicitly out of v1.
 | M3 session (login/status/logout/fetch) | done - Google SSO login, exit codes 0-6 |
 | M3b portal scraping (sso exchange, render, crawl) | done - akademik + elena sessions, per-mata-kuliah crawl |
 | M4 watch engine (run/daemon, diff, changelog, notify) | done - watch run/daemon, snapshots, notify hook |
-| M4 watch engine + daemon | todo |
 | M5 release v0.1.0 + docs | todo |
 
 ## Requirements
