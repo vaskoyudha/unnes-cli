@@ -3,6 +3,7 @@
 //! same shared fetch+parse functions the CLI commands use.
 
 use std::io::{self, IsTerminal, Stdout};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -351,6 +352,21 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
         eprintln!("unnes tui membutuhkan terminal interaktif (bukan pipe/file)");
         std::process::exit(1);
     }
+    // Session/data loading happens on a background thread so the screen and
+    // the keyboard stay responsive even while the portal prime takes a while.
+    let state: Arc<Mutex<Option<TuiState>>> = Arc::new(Mutex::new(None));
+    fn start_load(home: &UnnesHome, profile: &str, target: &Arc<Mutex<Option<TuiState>>>) {
+        let h = home.clone();
+        let p = profile.to_string();
+        let t = Arc::clone(target);
+        std::thread::spawn(move || {
+            let st = TuiState::load(&h, &p);
+            if let Ok(mut g) = t.lock() {
+                *g = Some(st);
+            }
+        });
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -363,29 +379,44 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
         return Ok(());
     }
 
-    terminal.draw(|f| {
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(" unnes tui ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD))),
-                Line::from(""),
-                Line::from("memuat data dari portal ... (tekan r untuk refresh, q untuk keluar)"),
-            ]),
-            f.area(),
-        );
-    })?;
-    let mut state = TuiState::load(home, profile);
+    start_load(home, profile, &state);
     let mut selected = 0usize;
     let mut last_refresh = Instant::now();
+    let mut loading_tick = 0usize;
     loop {
-        terminal.draw(|f| draw(&state, selected, f))?;
+        {
+            let guard = state.lock().unwrap();
+            match guard.as_ref() {
+                Some(st) => {
+                    terminal.draw(|f| draw(st, selected, f))?;
+                }
+                None => {
+                    loading_tick += 1;
+                    let dots = ".".repeat(1 + (loading_tick / 2) % 3);
+                    terminal.draw(|f| {
+                        f.render_widget(
+                            Paragraph::new(vec![
+                                Line::from(""),
+                                Line::from(Span::styled(" unnes tui ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD))),
+                                Line::from(""),
+                                Line::from(format!("memuat data dari portal{dots}  (q untuk keluar)")),
+                            ]),
+                            f.area(),
+                        );
+                    })?;
+                }
+            }
+        }
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('r') => {
-                            state = TuiState::load(home, profile);
+                            if let Ok(mut g) = state.lock() {
+                                *g = None;
+                            }
+                            start_load(home, profile, &state);
                             last_refresh = Instant::now();
                         }
                         KeyCode::Tab => selected = (selected + 1) % PANELS.len(),
@@ -399,7 +430,10 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
             }
         }
         if last_refresh.elapsed() >= AUTO_REFRESH {
-            state = TuiState::load(home, profile);
+            if let Ok(mut g) = state.lock() {
+                *g = None;
+            }
+            start_load(home, profile, &state);
             last_refresh = Instant::now();
         }
     }
