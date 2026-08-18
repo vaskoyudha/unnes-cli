@@ -12,6 +12,7 @@ mod diff;
 mod fetcher;
 mod output;
 mod paths;
+mod watch;
 
 use std::fs;
 use std::process::ExitCode;
@@ -124,6 +125,21 @@ enum WatchCmd {
         /// Field used as the record key when diffing
         #[arg(long)]
         key_field: Option<String>,
+        /// Render in the persistent browser session (Livewire / iframe-SSO)
+        #[arg(long)]
+        render: bool,
+        /// Gateway app id to prime the session (76 akademik, 30 elena, 64 student)
+        #[arg(long)]
+        sso_app: Option<String>,
+        /// URL visited before the target (e.g. semester switcher)
+        #[arg(long)]
+        pre_url: Option<String>,
+        /// Crawl mode: follow these links from the page
+        #[arg(long)]
+        link_selector: Option<String>,
+        /// Elena semester to open after SSO (default 20261)
+        #[arg(long)]
+        sso_semester: Option<String>,
     },
     /// Remove a watched page
     Rm { id: String },
@@ -198,10 +214,18 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Announcements(a) => cmd_fetch(&home, &profile, "announcements", a.csv, cli.json),
         Cmd::Watch(w) => match w.cmd {
             WatchCmd::List => watch_list(&home, cli.json),
-            WatchCmd::Add { .. } => Err(not_yet("watch add", "M4")),
-            WatchCmd::Rm { id } => Err(not_yet(&format!("watch rm {id}"), "M4")),
-            WatchCmd::Run { .. } => Err(not_yet("watch run", "M4")),
-            WatchCmd::Daemon => Err(not_yet("watch daemon", "M4")),
+            WatchCmd::Add { id, url, selector, interval, key_field, render, sso_app, pre_url, link_selector, sso_semester } => {
+                watch::add_page(&home, &id, &url, selector, interval, key_field, render, sso_app, pre_url, link_selector, sso_semester)?;
+                println!("page '{id}' added; run: unnes watch run --page_id {id}");
+                Ok(())
+            }
+            WatchCmd::Rm { id } => {
+                watch::rm_page(&home, &id)?;
+                println!("page '{id}' removed");
+                Ok(())
+            }
+            WatchCmd::Run { page_id } => cmd_watch_run(&home, &profile, page_id.as_deref(), cli.json),
+            WatchCmd::Daemon => watch::daemon(&home, &profile),
         },
         Cmd::Changelog(a) => changelog_list(&home, &a, cli.json),
     }
@@ -313,33 +337,8 @@ fn cmd_fetch(home: &UnnesHome, profile: &str, page_id: &str, csv: bool, json_out
     // persistent browser session; everything else is plain HTTP with an
     // automatic sso_token exchange on session expiry. link_selector pages
     // become crawls (follow links, extract rows on each linked page).
-    let mut job = if page.link_selector.is_some() {
-        fetcher::job("crawl", profile)
-    } else if page.render.unwrap_or(false) {
-        fetcher::job("page", profile)
-    } else {
-        fetcher::job("get", profile)
-    };
-    job["url"] = json!(page.url);
-    if let Some(sel) = &page.selector {
-        job["extract"] = json!({ "selector": sel });
-    }
-    if let Some(sel) = &page.link_selector {
-        job["linkSelector"] = json!(sel);
-    }
-    if let Some(pre) = &page.pre_url {
-        job["preUrl"] = json!(pre);
-    }
-    if let Some(sem) = &page.sso_semester {
-        job["semester"] = json!(sem);
-    }
-    if !page.normalize.is_empty() {
-        job["extraRegexes"] = json!(page.normalize);
-    }
-    if let Some(app) = &page.sso_app {
-        job["ssoApp"] = json!(app);
-    }
-    let res = fetcher::run_job(home, profile, job)?;
+    // Shared dispatch lives in watch::fetch_page (get/page/crawl + sso).
+    let res = watch::fetch_page(home, profile, page)?;
     if !res.ok {
         let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
         if code == "session" {
@@ -367,6 +366,35 @@ fn cmd_fetch(home: &UnnesHome, profile: &str, page_id: &str, csv: bool, json_out
         if records.is_empty() {
             return Err(app_err(6, format!("fetch {page_id}: no records matched selector '{sel}' - the page may have changed")));
         }
+    }
+    Ok(())
+}
+
+fn cmd_watch_run(home: &UnnesHome, profile: &str, only: Option<&str>, json_out: bool) -> Result<()> {
+    if !home.profile_jar_file(profile).is_file() {
+        return Err(app_err(3, format!("not logged in (profile {profile}); run: unnes login")));
+    }
+    let outcomes = watch::run_pass(home, profile, only)?;
+    if outcomes.is_empty() {
+        println!("no pages configured ({}); add one with: unnes watch add <id> --url=<page-url> --selector=<css>", home.config_file().display());
+        return Ok(());
+    }
+    let mut had_session_error = false;
+    for o in &outcomes {
+        if json_out {
+            println!("{}", serde_json::to_string(&serde_json::json!({
+                "page": o.page_id,
+                "changed": o.changed,
+                "summary": o.summary,
+            }))?);
+        } else {
+            let mark = if o.changed { "CHANGED" } else { "ok" };
+            println!("[{}] {} {}", o.page_id, mark, o.summary);
+        }
+        if o.summary.contains("session expired") { had_session_error = true; }
+    }
+    if had_session_error {
+        return Err(app_err(4, "session expired for one or more pages; run: unnes login"));
     }
     Ok(())
 }

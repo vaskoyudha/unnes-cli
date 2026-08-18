@@ -57,6 +57,8 @@ pub struct JobResult {
     pub retry_after: Option<u64>,
     #[serde(default)]
     pub records: Vec<Value>,
+    /// normalized page text (op=get only)
+    pub normalized: Option<String>,
     pub landing_url: Option<String>,
     pub captured_cookies: Option<u64>,
     pub mode: Option<String>,
