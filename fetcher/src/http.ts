@@ -115,7 +115,10 @@ export class HttpFetcher {
       // Login pages: Laravel /auth/login and the gateway's /login.
       const isLoginPath = (p: string) => p === "/login" || p.startsWith("/login/") || p.startsWith("/auth/login");
       const redirectedToLogin = isLoginPath(final.pathname) && !isLoginPath(requested.pathname);
-      const sessionExpired = redirectedToLogin || res.status === 401;
+      // Some portals answer expired sessions with HTTP 200 access-denied pages
+      // (duanol/Sikadu: "tidak diberi hak untuk mengakses fitur ini [tamu]!").
+      const denied = /tidak diberi hak untuk mengakses|\[tamu\]|sesi (anda )?berakhir/i.test(html);
+      const sessionExpired = redirectedToLogin || res.status === 401 || denied;
       let retryAfter: number | null = null;
       const ra = res.headers.get("retry-after");
       if (ra) {
