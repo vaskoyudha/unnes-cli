@@ -94,7 +94,7 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
     console.error("Opening " + hubUrl + " in your browser...");
     console.error("Sign in with your UNNES Google account. It auto-captures once");
     console.error("the SSO lands you on a UNNES app page, or press Enter here");
-    console.error("after you have signed in (Esc closes without saving).");
+    console.error("after you have signed in. Close the window to abort.");
     console.error("");
 
     const deadline = Date.now() + MAX_WAIT_MS;
@@ -116,7 +116,7 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
       const poll = (async (): Promise<string | null> => {
         if (Date.now() - started < GRACE_MS) return null;
         let url = "";
-        try { url = await page.url(); } catch { return null; }
+        try { url = await page.url(); } catch { return "closed"; } // window closed by the user
         let u: URL | null = null;
         try { u = new URL(url); } catch { return null; }
         if (u.hostname.endsWith("unnes.ac.id") && u.hostname !== "apps.unnes.ac.id") {
@@ -132,6 +132,10 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
     if (done === null) {
       await ctx.close();
       return fail("usage", "timed out waiting for login; no session captured");
+    }
+    if (done === "closed") {
+      await ctx.close();
+      return fail("usage", "browser window was closed; login aborted, no session saved");
     }
 
     // Give the handoff a moment to finish setting cookies.
