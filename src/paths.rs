@@ -58,6 +58,9 @@ impl UnnesHome {
     pub fn debug_dir(&self) -> PathBuf {
         self.root.join("debug")
     }
+    pub fn data_dir(&self) -> PathBuf {
+        self.root.join("data")
+    }
     pub fn changelog_file(&self) -> PathBuf {
         self.root.join("changelog.jsonl")
     }

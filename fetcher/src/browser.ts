@@ -676,6 +676,15 @@ export async function batchPages(
         if (entry.ssoApp && !primed.has(entry.ssoApp)) {
           await P.goto(hubUrl + "/" + entry.ssoApp, { waitUntil: "domcontentloaded", timeout: 60000 });
           await new Promise((r) => setTimeout(r, 6000));
+          let primeUrl = "";
+          try { primeUrl = await P.url(); } catch { /* closed */ }
+          if (/\/(auth\/)?login/i.test(primeUrl)) {
+            r.error = { code: "session", message: "gateway session expired; run: unnes login" };
+            r.sessionExpired = true;
+            results.push(r);
+            primed.add(entry.ssoApp);
+            continue;
+          }
           if (entry.ssoApp === "30") {
             await completeElenaSession(page as never, entry.semester ?? "20261");
           }

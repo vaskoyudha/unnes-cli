@@ -8,6 +8,7 @@
 
 mod changelog;
 mod config;
+mod data;
 mod diff;
 mod fetcher;
 mod output;
@@ -66,6 +67,8 @@ enum Cmd {
     Watch(WatchArgs),
     /// Discover gateway apps or elena courses and print watch recipes
     Discover(DiscoverArgs),
+    /// Stored data: list/show/history/export captured page states
+    Data(DataArgs),
     /// Print the change log.
     Changelog(ChangelogArgs),
 }
@@ -158,6 +161,36 @@ enum WatchCmd {
 }
 
 #[derive(Args)]
+struct DataArgs {
+    #[command(subcommand)]
+    cmd: DataCmd,
+}
+
+#[derive(Subcommand)]
+enum DataCmd {
+    /// List stored datasets (one per configured page) with capture counts
+    List,
+    /// Show the latest stored records of a page (table/--csv/--json)
+    Show {
+        /// Page id from config.toml
+        page_id: String,
+        /// Emit CSV instead of a table (overrides --json)
+        #[arg(long)]
+        csv: bool,
+    },
+    /// Show the capture timeline (distinct states stored so far)
+    History { page_id: String },
+    /// Export the full history (--csv: latest state as CSV lines)
+    Export {
+        /// Page id from config.toml
+        page_id: String,
+        /// Emit CSV for the latest state (default: full history JSON)
+        #[arg(long)]
+        csv: bool,
+    },
+}
+
+#[derive(Args)]
 struct DiscoverArgs {
     /// List elena courses (requires a session) instead of gateway apps
     #[arg(long)]
@@ -240,6 +273,7 @@ fn run(cli: Cli) -> Result<()> {
             WatchCmd::Daemon => watch::daemon(&home, &profile),
         },
         Cmd::Discover(a) => cmd_discover(&home, &profile, &a, cli.json),
+        Cmd::Data(d) => cmd_data(&home, &profile, &d.cmd, cli.json),
         Cmd::Changelog(a) => changelog_list(&home, &a, cli.json),
     }
 }
@@ -401,6 +435,93 @@ fn slugify(name: &str) -> String {
 
 /// unnes discover: list gateway apps or elena courses with ready-to-run
 /// watch add commands.
+/// unnes data: List / Show / History / Export of the stored page states.
+fn cmd_data(home: &UnnesHome, _profile: &str, cmd: &DataCmd, json_out: bool) -> Result<()> {
+    let cfg = Config::load(home)?;
+    match cmd {
+        DataCmd::List => {
+            let mut rows: Vec<serde_json::Value> = Vec::new();
+            for page in &cfg.pages {
+                let entries = crate::data::read(home, &page.id).unwrap_or_default();
+                let last = entries.last().map(|e| e.at.clone()).unwrap_or_default();
+                rows.push(serde_json::json!({
+                    "page": page.id,
+                    "states": entries.len(),
+                    "records": entries.last().map(|e| e.records.len()).unwrap_or(0),
+                    "last_capture": last,
+                }));
+            }
+            if json_out {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!("stored datasets ({}):", rows.len());
+                if rows.is_empty() {
+                    println!("  none yet - run: unnes watch run");
+                }
+                for r in &rows {
+                    let last = r["last_capture"].as_str().unwrap_or("-");
+                    println!(
+                        "  {:<16} {} states, {} records, last {}",
+                        r["page"].as_str().unwrap_or(""),
+                        r["states"].as_u64().unwrap_or(0),
+                        r["records"].as_u64().unwrap_or(0),
+                        &last[..11.min(last.len())],
+                    );
+                }
+            }
+        }
+        DataCmd::Show { page_id, csv } => {
+            let latest = crate::data::latest(home, page_id)?
+                .ok_or_else(|| app_err(1, format!("no stored data for '{page_id}' yet; run: unnes watch run")))?;
+            if *csv {
+                println!("{}", output::records_csv(&latest.records));
+            } else if json_out {
+                println!("{}", output::records_json(&latest.records));
+            } else {
+                let at = &latest.at[..11.min(latest.at.len())];
+                println!("{page_id} @ {at}:");
+                println!("{}", output::records_table(&latest.records));
+            }
+        }
+        DataCmd::History { page_id } => {
+            let entries = crate::data::read(home, page_id)?;
+            if entries.is_empty() {
+                println!("no stored data for '{page_id}' yet; run: unnes watch run");
+                return Ok(());
+            }
+            let rows: Vec<serde_json::Value> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| serde_json::json!({ "#": i + 1, "at": e.at, "records": e.records.len() }))
+                .collect();
+            if json_out {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!("{page_id} history ({} states):", entries.len());
+                println!("{}", output::records_table(&rows));
+            }
+        }
+        DataCmd::Export { page_id, csv } => {
+            let entries = crate::data::read(home, page_id)?;
+            if entries.is_empty() {
+                println!("no stored data for '{page_id}' yet; run: unnes watch run");
+                return Ok(());
+            }
+            if *csv {
+                let last = entries.last().unwrap();
+                println!("{}", output::records_csv(&last.records));
+            } else {
+                let full: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|e| serde_json::json!({ "at": e.at, "records": e.records }))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&full)?);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_discover(home: &UnnesHome, profile: &str, args: &DiscoverArgs, json_out: bool) -> Result<()> {
     if !home.profile_jar_file(profile).is_file() {
         return Err(app_err(3, format!("not logged in (profile {profile}); run: unnes login")));

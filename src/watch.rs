@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 
 use crate::changelog::{self, ChangelogEntry};
 use crate::config::{Config, Page};
+use crate::data;
 use crate::diff::{diff_lines, diff_records, DiffResult};
 use crate::fetcher::{self, JobResult};
 use chrono::{Datelike, Timelike};
@@ -189,6 +190,9 @@ fn handle_result(
         summary = "no change".to_string();
     }
 
+    // Durable full-state history (deduped): keep every distinct state.
+    let _ = data::append(home, &page.id, &records);
+
     if let Err(e) = save_snapshot(&path, &records, normalized.as_deref()) {
         return WatchOutcome { page_id: page.id.clone(), changed, summary: format!("snapshot error: {e:#}") };
     }
@@ -215,7 +219,11 @@ pub fn run_pass(home: &UnnesHome, profile: &str, only: Option<&str>) -> Result<V
                     res.results.iter().map(|r| (r.url.as_str(), r)).collect();
                 for page in &render_pages {
                     match by_url.get(page.url.as_str()) {
-                        Some(r) => out.push(handle_result(home, page, r.records.clone(), None, r.session_expired, false)),
+                        Some(r) if r.ok => out.push(handle_result(home, page, r.records.clone(), None, r.session_expired, false)),
+                        Some(r) => {
+                            let msg = r.error.as_ref().map(|e| format!("{} ({})", e.message, e.code)).unwrap_or_else(|| "unknown batch error".into());
+                            out.push(WatchOutcome { page_id: page.id.clone(), changed: false, summary: format!("ERROR: {msg}") });
+                        }
                         None => out.push(WatchOutcome { page_id: page.id.clone(), changed: false, summary: "ERROR: batch returned no result for this page".into() }),
                     }
                 }

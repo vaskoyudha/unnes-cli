@@ -84,10 +84,23 @@ Exit codes: 0 ok, 1 generic, 2 usage, 3 not logged in, 4 session expired,
     unnes watch run [--page-id] one pass: fetch -> diff -> changelog -> notify
     unnes watch daemon          adaptive polling loop (jitter + adaptive windows)
     unnes discover [--elena]    list gateway apps / elena courses + watch recipes
+    unnes data list             stored datasets (one per page) + capture counts
+    unnes data show <page>      latest stored records (table/--csv/--json)
+    unnes data history <page>   capture timeline of distinct states
+    unnes data export <page>    full history JSON (--csv: latest state)
     unnes changelog [--since=... --page-id=...]
 
 Render/crawl pages in one watch pass share a single browser session (op=batch),
 so the Elena SSO handshake runs once, not per page.
+
+## Stored data (unnes data)
+
+Every successful fetch/watch pass stores the page's records as a timestamped
+state in data/<page-id>.jsonl (deduped: only distinct states are kept).
+The biodata page captures your identity (NIM, angkatan, prodi, dosen wali,
+kontak); hasil-studi captures grades per mata kuliah once your study plan
+exists; elena-kursus captures each course's activities. Export with:
+unnes data export <page> --csv   (or --json for the full history)
 
 ## Scraping mechanism (verified against the live portal)
 
