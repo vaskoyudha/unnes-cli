@@ -287,6 +287,8 @@ export interface RenderPageResult {
 }
 
 const LOGIN_MARKERS = /login dengan unnes-id|masukan email dan password|username\s+password/i;
+// Moodle shows an inline login page instead of redirecting.
+const MOODLE_LOGIN_MARKERS = /you are not logged in|you must be logged in|log in\s*\|/i;
 
 async function launchContext(browserDir: string): Promise<unknown> {
   const chromium = await import("playwright").then(
@@ -411,7 +413,7 @@ export async function renderPage(jarPath: string, browserDir: string, opts: Rend
     // gateway's login page (has the UNNES-ID button) is showing.
     const body = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
     const landedOnGateway = finalUrl.startsWith("https://apps.unnes.ac.id");
-    const sessionExpired = (landedOnGateway && LOGIN_MARKERS.test(body)) || /\/auth\/login/i.test(finalUrl);
+    const sessionExpired = (landedOnGateway && LOGIN_MARKERS.test(body)) || /\/auth\/login/i.test(finalUrl) || MOODLE_LOGIN_MARKERS.test(body);
     if (sessionExpired) {
       return { ...base, finalUrl, sessionExpired: true, capturedCookies: captured, error: { code: "session", message: "session expired; run: unnes login" } };
     }
@@ -709,7 +711,7 @@ export async function batchPages(
           // 3. session health
           const body = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
           const landedOnGateway = (r.finalUrl ?? "").startsWith("https://apps.unnes.ac.id");
-          r.sessionExpired = (landedOnGateway && LOGIN_MARKERS.test(body)) || /\/auth\/login/i.test(r.finalUrl ?? "");
+          r.sessionExpired = (landedOnGateway && LOGIN_MARKERS.test(body)) || /\/auth\/login/i.test(r.finalUrl ?? "") || MOODLE_LOGIN_MARKERS.test(body);
           if (r.sessionExpired) {
             results.push(r);
             continue;

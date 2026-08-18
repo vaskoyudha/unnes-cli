@@ -84,6 +84,9 @@ Exit codes: 0 ok, 1 generic, 2 usage, 3 not logged in, 4 session expired,
     unnes watch run [--page-id] one pass: fetch -> diff -> changelog -> notify
     unnes watch daemon          adaptive polling loop (jitter + adaptive windows)
     unnes discover [--elena]    list gateway apps / elena courses + watch recipes
+
+A complete starting config with grades/schedule/biodata/course recipes lives in
+examples/config.example.toml (copy to ~/.config/unnes/config.toml and edit).
     unnes data list             stored datasets (one per page) + capture counts
     unnes data show <page>      latest stored records (table/--csv/--json)
     unnes data history <page>   capture timeline of distinct states

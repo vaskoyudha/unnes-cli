@@ -1,0 +1,91 @@
+# unnes-cli example configuration (config.toml -> ~/.config/unnes/config.toml or $UNNES_HOME)
+# Dispositions: verify with: unnes watch list / unnes fetch <page-id>
+
+[general]
+base_url = "https://apps.unnes.ac.id"
+default_interval = 900   # seconds between watch daemon passes
+min_interval = 60
+jitter_fraction = 0.1
+
+[notify]
+# command = "notify-send 'unnes'"  # run on change; changelog JSON on stdin
+
+# --- Sikadu / akademik (Livewire -> browser render) ---
+[[pages]]
+id = "krs"
+url = "https://akademik.unnes.ac.id/krs-mahasiswa"
+selector = "tbody tr"
+render = true
+sso_app = "76"
+
+[[pages]]
+id = "hasil-studi"
+url = "https://akademik.unnes.ac.id/hasil-studi"
+selector = "tbody tr"
+render = true
+sso_app = "76"
+
+# Identity: NIM, angkatan, prodi, dosen wali, kontak (44 fields)
+[[pages]]
+id = "biodata"
+url = "https://akademik.unnes.ac.id/biodata-mahasiswa"
+selector = ".detail-item"
+render = true
+sso_app = "76"
+
+# Schedule (empty until a study plan exists for the active semester)
+[[pages]]
+id = "jadwal"
+url = "https://akademik.unnes.ac.id/jadwal_perkuliahan"
+selector = "tbody tr"
+render = true
+sso_app = "76"
+
+# Grades per semester of study (fill the pre_url with change-semester links
+# from: unnes discover / the list-semester page)
+# [[pages]]
+# id = "hasil-studi-20241"
+# url = "https://akademik.unnes.ac.id/hasil-studi"
+# selector = "tbody tr"
+# render = true
+# sso_app = "76"
+# pre_url = "https://akademik.unnes.ac.id/dashboard/change-semester/9c8e9127-0a23-439f-924e-8a5fb5270b41"
+
+# --- Elena (Moodle) ---
+# Every enrolled mata kuliah: course list -> each course's activities
+[[pages]]
+id = "elena-kursus"
+url = "https://elena.unnes.ac.id/my/courses.php"
+selector = ".activity-item"
+link_selector = "a[href*='/course/view.php']"
+render = true
+sso_app = "30"
+sso_semester = "20261"
+
+# Grades for every enrolled course (Moodle grade overview)
+[[pages]]
+id = "elena-nilai"
+url = "https://elena.unnes.ac.id/grade/report/overview/index.php"
+selector = "tbody tr"
+render = true
+sso_app = "30"
+sso_semester = "20261"
+
+# Per-course grade report (fill the course id from elena-kursus _source):
+# [[pages]]
+# id = "nilai-grafika"
+# url = "https://elena.unnes.ac.id/grade/report/user/index.php?id=1107"
+# selector = "tbody tr"
+# render = true
+# sso_app = "30"
+# sso_semester = "20261"
+
+# Per-course assignment crawl (pengumpulan):
+# [[pages]]
+# id = "tugas-grafika"
+# url = "https://elena.unnes.ac.id/course/view.php?id=1107"
+# selector = ".activity-item"
+# link_selector = "a[href*='/mod/assign/view.php']"
+# render = true
+# sso_app = "30"
+# sso_semester = "20261"
