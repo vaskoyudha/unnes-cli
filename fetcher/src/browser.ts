@@ -78,15 +78,27 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
 
   const ctx = browser as {
     newContext(): Promise<{
-      newPage(): Promise<{ url(): Promise<string>; goto(u: string, o?: unknown): Promise<unknown> }>;
+      newPage(): Promise<{
+        url(): Promise<string>;
+        goto(u: string, o?: unknown): Promise<unknown>;
+        on(ev: string, cb: () => void): void;
+        isClosed(): boolean;
+      }>;
       cookies(): Promise<PlaywrightCookie[]>;
     }>;
+    on(ev: string, cb: () => void): void;
     close(): Promise<void>;
   };
 
   try {
     const context = await ctx.newContext();
     const page = await context.newPage();
+    // Window close is NOT observable via page.url() (it keeps returning the
+    // last URL); use Playwright's close/disconnected events and isClosed().
+    let pageClosed = false;
+    page.on("close", () => { pageClosed = true; });
+    let browserGone = false;
+    ctx.on("disconnected", () => { browserGone = true; });
     await page.goto(hubUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
 
     // Instructions go to stderr: stdout is reserved for the single JSON result.
@@ -115,8 +127,9 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
     while (Date.now() < deadline && done === null) {
       const poll = (async (): Promise<string | null> => {
         if (Date.now() - started < GRACE_MS) return null;
+        if (pageClosed || browserGone || page.isClosed()) return "closed";
         let url = "";
-        try { url = await page.url(); } catch { return "closed"; } // window closed by the user
+        try { url = await page.url(); } catch { return "closed"; } // defensive
         let u: URL | null = null;
         try { u = new URL(url); } catch { return null; }
         if (u.hostname.endsWith("unnes.ac.id") && u.hostname !== "apps.unnes.ac.id") {
