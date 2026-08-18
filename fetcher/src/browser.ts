@@ -23,8 +23,12 @@ export interface BrowserLoginResult {
 }
 
 const HUB_URL = "https://apps.unnes.ac.id/";
-const SESSION_HINT_NAMES = ["laravel_session", "session", "sso_session", "unnes_session"];
+// Cookies apps.unnes.ac.id sets for every visitor, before any sign-in:
+// XSRF-TOKEN + laravel_session (guest session, host-only) and
+// G_ENABLED_IDPS (Google platform, domain-wide). They are NOT proof of login.
+const GUEST_COOKIES = new Set(["XSRF-TOKEN", "laravel_session", "G_ENABLED_IDPS"]);
 const IDLE_MS = 500; // poll interval while waiting for the user
+const GRACE_MS = 3000; // ignore auto-triggers during the first seconds
 const MAX_WAIT_MS = 10 * 60 * 1000; // give up after 10 minutes
 
 interface PlaywrightCookie {
@@ -88,36 +92,35 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
     // Instructions go to stderr: stdout is reserved for the single JSON result.
     console.error("");
     console.error("Browser opened: sign in with your UNNES Google account.");
-    console.error("This window auto-captures once the SSO handoff lands;");
+    console.error("It auto-captures once the SSO lands you on a UNNES app page,");
     console.error("or press Enter here after you have signed in.");
     console.error("");
 
     const deadline = Date.now() + MAX_WAIT_MS;
+    const started = Date.now();
     let done: string | null = null;
 
-    // Wait for the handoff (URL left the hub login page, or a domain-wide
-    // cookie appeared) or an Enter keypress on stdin.
+    // Enter on stdin = the human says "I am logged in".
     const enter = new Promise<string>((resolve) => {
       process.stdin.setEncoding("utf8");
       process.stdin.once("data", () => resolve("enter"));
     });
+
+    // Auto-detect: the browser left the hub host for another *.unnes.ac.id
+    // subdomain (the SSO handoff). Guest cookies alone (laravel_session,
+    // XSRF-TOKEN, G_ENABLED_IDPS) are deliberately NOT a trigger - they
+    // exist before login, and a name-based check cannot tell guest from
+    // authenticated sessions.
     while (Date.now() < deadline && done === null) {
       const poll = (async (): Promise<string | null> => {
+        if (Date.now() - started < GRACE_MS) return null;
         let url = "";
         try { url = await page.url(); } catch { return null; }
         let u: URL | null = null;
         try { u = new URL(url); } catch { return null; }
-        const onUnnes = u.hostname.endsWith("unnes.ac.id");
-        const leftHubRoot = onUnnes && (u.hostname !== "apps.unnes.ac.id" || u.pathname !== "/" || u.search !== "");
-        const cookies = await context.cookies();
-        const domainCookie = cookies.some(
-          (c) => c.domain.startsWith(".") && c.domain.endsWith("unnes.ac.id"),
-        );
-        const sessionHint = cookies.some(
-          (c) => c.domain.endsWith("unnes.ac.id") && SESSION_HINT_NAMES.includes(c.name),
-        );
-        if (leftHubRoot || domainCookie) return "handoff";
-        if (sessionHint && !url.includes("accounts.google.com")) return "cookies";
+        if (u.hostname.endsWith("unnes.ac.id") && u.hostname !== "apps.unnes.ac.id") {
+          return "handoff";
+        }
         return null;
       })();
       const winner = await Promise.race([poll, enter]);
@@ -139,8 +142,10 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
     const all = await context.cookies();
     const jar = CookieJar.empty();
     let captured = 0;
+    const names = new Set<string>();
     for (const c of all as PlaywrightCookie[]) {
       if (!c.domain.endsWith("unnes.ac.id")) continue;
+      names.add(c.name);
       jar.addCookie({
         name: c.name,
         value: c.value,
@@ -154,14 +159,25 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
     }
     await jar.save(jarPath);
 
-    const authCookies = all.filter(
-      (c) => c.domain.endsWith("unnes.ac.id") && SESSION_HINT_NAMES.includes(c.name),
-    );
-    if (authCookies.length === 0) {
+    if (captured === 0) {
       await ctx.close();
-      return fail("usage", "captured cookies but no session cookie found; did the Google sign-in complete?");
+      return fail("usage", "captured no unnes.ac.id cookies; did the Google sign-in complete?");
     }
 
+    // When auto-triggered, require some evidence of a real session: a cookie
+    // beyond the guest trio, or a landing page outside the hub.
+    if (done === "handoff") {
+      const hasNonGuest = [...names].some((n) => !GUEST_COOKIES.has(n));
+      let host = "";
+      try { host = new URL(landingUrl ?? "").hostname; } catch { /* ignore */ }
+      const leftHub = host !== "" && host !== "apps.unnes.ac.id";
+      if (!hasNonGuest && !leftHub) {
+        await ctx.close();
+        return fail("usage", "auto-capture fired but only guest cookies present (" + [...names].join(", ") + "); did the Google sign-in complete?");
+      }
+    }
+
+    console.error("captured " + captured + " unnes.ac.id cookies: " + [...names].sort().join(", "));
     await ctx.close();
     return { contract: 1, ok: true, mode: "browser", landingUrl, capturedCookies: captured };
   } catch (err) {
