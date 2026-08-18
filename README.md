@@ -103,6 +103,11 @@ examples/config.example.toml (copy to ~/.config/unnes/config.toml and edit).
     unnes data history <page>   capture timeline of distinct states
     unnes data export <page>    full history JSON (--csv: latest state)
     unnes kurikulum             all mata kuliah by semester: LULUS/BERJALAN/BELUM DITEMPUH
+    unnes jadwal                weekly class schedule (room/day/time per session)
+    unnes tugas                 Elena assignments/quizzes with deadlines + status
+    unnes tui                   interactive terminal dashboard (ratatui):
+                                tabs Dashboard/Kurikulum/Jadwal/Tugas/Changelog,
+                                keys 1-5/Tab switch, r refresh, q/Esc quit
     unnes changelog [--since=... --page-id=...]
 
 Render/crawl pages in one watch pass share a single browser session (op=batch),
