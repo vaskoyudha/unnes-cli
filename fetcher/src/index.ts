@@ -60,8 +60,10 @@ export async function processJob(job: Job): Promise<JobResult> {
     }
     case "login": {
       if (job.mode === "browser") {
+        // Google SSO lives on the apps.unnes.ac.id hub - never job.baseUrl,
+        // which is the DATA portal and has no Google sign-in.
         const { browserLogin } = await import("./browser.js");
-        return browserLogin(profilePath, baseUrl);
+        return browserLogin(profilePath);
       }
       if (!job.form) return fail("usage", "op=login requires form{email,password}");
       return opLogin(f, baseUrl, profilePath, jar, job.form);

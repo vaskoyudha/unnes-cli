@@ -40,11 +40,14 @@ network | timeout | csrf | login | usage | contract | internal.
 - login mode=form (default): GET login page, harvest _token, POST form with
   the cookie jar, detect success by final URL/status, save jar. The UNNES
   student portal keeps this legacy path, but the canonical login is SSO.
-- login mode=browser: Google SSO (apps.unnes.ac.id) via a headed Chromium
-  window (Playwright). The user signs in interactively; all *.unnes.ac.id
-  cookies are captured into the jar and the SSO landing URL is reported.
-  Requires npx playwright install chromium once. Never runs headless in
-  cron paths - only during interactive unnes login.
+- login mode=browser: Google SSO via a headed Chromium window (Playwright).
+  The browser ALWAYS opens the SSO hub https://apps.unnes.ac.id/ - job.baseUrl
+  is the data portal and is deliberately ignored for browser login (it has no
+  Google sign-in). The user signs in interactively; all *.unnes.ac.id cookies
+  are captured into the jar and the SSO landing URL is reported. Auto-capture
+  fires only when the browser leaves the hub host (SSO handoff) or on an
+  explicit Enter. Requires npx playwright install chromium once. Never runs
+  headless in cron paths - only during interactive unnes login.
 - get: sessionExpired when a non-login URL lands on /auth/login or 401;
   the CLI then tells the user to re-run login (SSO cannot auto re-login).
 - challenge: heuristic for Cloudflare 403 challenge pages; CLI backs off.

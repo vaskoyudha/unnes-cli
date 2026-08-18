@@ -91,9 +91,10 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
 
     // Instructions go to stderr: stdout is reserved for the single JSON result.
     console.error("");
-    console.error("Browser opened: sign in with your UNNES Google account.");
-    console.error("It auto-captures once the SSO lands you on a UNNES app page,");
-    console.error("or press Enter here after you have signed in.");
+    console.error("Opening " + hubUrl + " in your browser...");
+    console.error("Sign in with your UNNES Google account. It auto-captures once");
+    console.error("the SSO lands you on a UNNES app page, or press Enter here");
+    console.error("after you have signed in (Esc closes without saving).");
     console.error("");
 
     const deadline = Date.now() + MAX_WAIT_MS;
@@ -173,7 +174,7 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
       const leftHub = host !== "" && host !== "apps.unnes.ac.id";
       if (!hasNonGuest && !leftHub) {
         await ctx.close();
-        return fail("usage", "auto-capture fired but only guest cookies present (" + [...names].join(", ") + "); did the Google sign-in complete?");
+        return fail("usage", "auto-capture fired but only guest cookies present (" + [...names].join(", ") + "). Sign in on the Google page, then press Enter here.");
       }
     }
 
