@@ -3,7 +3,7 @@
 Cargo.lock.orig
 
 # Node fetcher
-/node_modules/
+node_modules/
 /fetcher/dist/
 
 # Secrets - never commit

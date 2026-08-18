@@ -19,8 +19,8 @@ automation is a later fallback). The engine is headless; a TUI is explicitly out
 | Milestone | State |
 |---|---|
 | M0 scaffold + git | done (this commit) |
-| M1 core Rust (config/paths/output/diff/changelog) | todo |
-| M2 Node/TS fetcher arm | todo |
+| M1 core Rust (config/paths/output/diff/changelog) | done (21 tests) |
+| M2 Node/TS fetcher arm | done (10 contract tests) |
 | M3 session (login/status/logout/auto re-login) | todo |
 | M4 watch engine + daemon | todo |
 | M5 release v0.1.0 + docs | todo |

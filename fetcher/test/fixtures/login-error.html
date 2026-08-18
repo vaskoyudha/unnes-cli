@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Login - MyUNNES-Students</title>
+</head>
+<body>
+  <form method="POST" action="/auth/login">
+    <input type="hidden" name="_token" value="TOKENVALUE">
+    <input class="form-control" type="email" name="email" value="bad@example.com">
+    <input class="form-control" type="password" name="password">
+  </form>
+  <div class="alert alert-danger" role="alert">
+    These credentials do not match our records.
+  </div>
+</body>
+</html>

@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Login - MyUNNES-Students</title>
+  <meta name="csrf-token" content="META-CSRF-FIXTURE">
+</head>
+<body>
+  <form method="POST" action="/auth/login">
+    <input type="hidden" name="_token" value="TOKENVALUE">
+    <input class="form-control" type="email" name="email" id="email" placeholder="Masukan email Anda" required="true">
+    <input class="form-control" type="password" name="password" id="password" placeholder="Masukan password Anda" required="true">
+    <button type="submit" class="btn btn-soft-primary me-1 mb-1 btn-submit">Login</button>
+  </form>
+</body>
+</html>

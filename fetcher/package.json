@@ -1,0 +1,15 @@
+{
+  "name": "unnes-fetcher",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Node/TS fetch arm for unnes-cli: HTTP + cookie jar + login + normalize + extract",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": { "cheerio": "^1.0.0" },
+  "devDependencies": { "@types/node": "^22.10.0", "typescript": "^5.7.0" }
+}
