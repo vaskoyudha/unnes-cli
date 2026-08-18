@@ -6,6 +6,13 @@
 //! courses, "Peringatan" for the running semester, "Belum ditempuh" later).
 
 use serde::Serialize;
+use anyhow::{bail, Result};
+use serde_json::json;
+
+use crate::config::Config;
+use crate::fetcher;
+use crate::paths::UnnesHome;
+use crate::watch;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Kursus {
@@ -41,8 +48,64 @@ impl Kursus {
     }
 }
 
+/// Resolve the student NIM: config.general.nim, else the stored biodata.
+pub fn resolve_nim(home: &UnnesHome) -> Option<String> {
+    if let Ok(cfg) = Config::load(home) {
+        if let Some(n) = &cfg.general.nim {
+            return Some(n.clone());
+        }
+    }
+    if let Ok(Some(entry)) = crate::data::latest(home, "biodata") {
+        for r in &entry.records {
+            let t = r.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(n) = t.strip_prefix("NIM ").map(|n| n.trim().to_string()) {
+                if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Fetch the curriculum page (plain HTTP; browser prime + retry when the
+/// duanol session is missing) and parse every course.
+pub fn fetch_and_parse(home: &UnnesHome, profile: &str, nim: &str) -> Result<Vec<Kursus>> {
+    let url = format!("https://duanol.unnes.ac.id/v2/prakuliah/kurikulum/get_kurikulum_mhs/{nim}.aspx");
+    let fetch = |u: &str| -> Result<(bool, String)> {
+        let mut job = fetcher::job("get", profile);
+        job["url"] = json!(u);
+        let res = fetcher::run_job(home, profile, job)?;
+        if !res.ok {
+            let msg = res.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+            return Ok((false, msg));
+        }
+        if res.session_expired {
+            return Ok((false, "session expired".into()));
+        }
+        Ok((true, res.normalized.unwrap_or_default()))
+    };
+    let (mut ok, mut text) = fetch(&url)?;
+    if !ok {
+        let _ = watch::ensure_session(home, profile);
+        let cfg = Config::load(home)?;
+        let page = cfg.pages.iter().find(|p| p.id == "sikadu-krs").cloned().unwrap_or_default();
+        let _ = watch::fetch_page(home, profile, &page);
+        let second = fetch(&url)?;
+        ok = second.0;
+        if !ok {
+            bail!("duanol session unavailable; run: unnes login");
+        }
+        text = second.1;
+    }
+    let kursus = parse_curriculum(&text);
+    if kursus.is_empty() {
+        bail!("no courses parsed - the page structure may have changed");
+    }
+    Ok(kursus)
+}
+
 /// Parse the page's flattened text into course records. Lines look like:
-///   "1 1 20P00797 Algoritma dan Pemrograman T/P 3 Wajib OK A"
 pub fn parse_curriculum(text: &str) -> Vec<Kursus> {
     let mut out = Vec::new();
     // The fetcher's normalized output keeps the HTML tags; flatten to plain

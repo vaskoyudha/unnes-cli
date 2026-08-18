@@ -588,66 +588,15 @@ fn cmd_data(home: &UnnesHome, _profile: &str, cmd: &DataCmd, json_out: bool) -> 
     Ok(())
 }
 
-/// Resolve the student NIM: config.general.nim, else the stored biodata.
-fn resolve_nim(home: &UnnesHome) -> Option<String> {
-    if let Ok(cfg) = Config::load(home) {
-        if let Some(n) = &cfg.general.nim {
-            return Some(n.clone());
-        }
-    }
-    if let Ok(Some(entry)) = crate::data::latest(home, "biodata") {
-        for r in &entry.records {
-            let t = r.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(n) = t.strip_prefix("NIM ").map(|n| n.trim().to_string()) {
-                if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
-                    return Some(n);
-                }
-            }
-        }
-    }
-    None
-}
-
 /// unnes kurikulum: full curriculum grouped by semester with status
 /// categories (LULUS / BERJALAN / BELUM DITEMPUH) per mata kuliah.
 fn cmd_kurikulum(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
-    let nim = resolve_nim(home)
+    let nim = kurikulum::resolve_nim(home)
         .ok_or_else(|| app_err(1, "cannot determine NIM - set [general] nim in config or run unnes watch run first (biodata)"))?;
-    let url = format!("https://duanol.unnes.ac.id/v2/prakuliah/kurikulum/get_kurikulum_mhs/{nim}.aspx");
-
-    // Fetch: plain HTTP first; if the duanol session is missing, prime it via
-    // the browser (app 23) and retry once.
-    let fetch_ok = |u: &str| -> Result<(bool, String)> {
-        let mut job = fetcher::job("get", profile);
-        job["url"] = json!(u);
-        let res = fetcher::run_job(home, profile, job)?;
-        if !res.ok {
-            let msg = res.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
-            return Ok((false, msg));
-        }
-        if res.session_expired {
-            return Ok((false, "session expired".into()));
-        }
-        Ok((true, res.normalized.unwrap_or_default()))
-    };
-    let (mut ok, mut text) = fetch_ok(&url)?;
-    if !ok {
-        // prime the duanol session via a render pass (syncs cookies to jar)
-        let cfg = Config::load(home)?;
-        let page = cfg.pages.iter().find(|p| p.id == "sikadu-krs").cloned().unwrap_or_default();
-        let _ = watch::fetch_page(home, profile, &page);
-        let second = fetch_ok(&url)?;
-        ok = second.0;
-        if !ok {
-            return Err(app_err(4, "kurikulum: duanol session unavailable; run: unnes login"));
-        }
-        text = second.1;
-    }
-
-    let kursus = kurikulum::parse_curriculum(&text);
-    if kursus.is_empty() {
-        return Err(app_err(1, "kurikulum: no courses parsed - the page structure may have changed"));
-    }
+    let kursus = kurikulum::fetch_and_parse(home, profile, &nim).map_err(|e| match format!("{e:#}") {
+        m if m.contains("session unavailable") || m.contains("session expired") => app_err(4, format!("kurikulum: {m}")),
+        m => app_err(1, format!("kurikulum: {m}")),
+    })?;
 
     if json_out {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
@@ -692,7 +641,7 @@ fn cmd_kurikulum(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> 
 
 /// unnes jadwal: weekly class schedule from the Sikadu 2.4 KRS form.
 fn cmd_jadwal(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
-    let nim = resolve_nim(home)
+    let nim = kurikulum::resolve_nim(home)
         .ok_or_else(|| app_err(1, "cannot determine NIM - set [general] nim in config or run unnes watch run first (biodata)"))?;
     let url = format!("https://duanol.unnes.ac.id/v2/prakuliah/krs/form_isi_krs/{nim}.aspx");
 
