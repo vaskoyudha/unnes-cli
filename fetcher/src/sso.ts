@@ -27,6 +27,10 @@ const APP_TABLE: Record<string, SsoConfig> = {
   "76": { appId: "76", loginUrl: "https://akademik.unnes.ac.id/auth/sso_login", method: "get-post" },
   "64": { appId: "64", loginUrl: "https://student.unnes.ac.id/auth/sso_login", method: "get-post" },
   "30": { appId: "30", loginUrl: "https://elena.unnes.ac.id/portal/apis/sso", method: "get" },
+  // App 23 = Sikadu 2.4 (duanol.unnes.ac.id/v2): the exchange runs in the
+  // gateway iframe (xcomponent); no reliable plain-HTTP equivalent, so it is
+  // primed through the persistent browser session (render/batch with ssoApp).
+  "23": { appId: "23", loginUrl: "https://duanol.unnes.ac.id/v2/Primer/loginfromapps.aspx", method: "get" },
 };
 
 /** Map a data-subdomain host to the gateway app that gates it. */
@@ -34,6 +38,7 @@ export function appForHost(host: string): SsoConfig | null {
   if (host === "akademik.unnes.ac.id") return APP_TABLE["76"];
   if (host === "student.unnes.ac.id") return APP_TABLE["64"];
   if (host === "elena.unnes.ac.id") return APP_TABLE["30"];
+  if (host === "duanol.unnes.ac.id") return APP_TABLE["23"];
   return null;
 }
 

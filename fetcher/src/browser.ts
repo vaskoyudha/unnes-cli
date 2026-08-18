@@ -758,90 +758,182 @@ export async function autoLogin(jarPath: string, browserDir: string): Promise<Br
   if (process.env.UNNES_NO_BROWSER) {
     return fail("usage", "auto login disabled via UNNES_NO_BROWSER");
   }
+
+  // 1. Headless scripted attempt: zero windows when Google cooperates.
+  {
+    const res = await scriptedOAuth(jarPath, browserDir, true);
+    if (res) return res;
+  }
+
+  // 2. Headed attempt via the hub's own Google button: gapi's onSignIn keeps
+  //    the token in page state (currentUser), so we do not depend on the
+  //    popup's opener channel at all. Scripted clicks handle chooser/consent.
+  {
+    const res = await scriptedOAuth(jarPath, browserDir, false);
+    if (res) return res;
+  }
+
+  // 3. Google demanded human interaction: keep a headed window open with the
+  //    standard flow - the user completes ONE click (saved profile makes it
+  //    a single confirmation).
+  const { browserLogin } = await import("./browser.js");
+  return browserLogin(jarPath, browserDir);
+}
+
+// ---------------------------------------------------------------------------
+// Drive the Google login scripted: headless or headed. Two token channels:
+//   A) postmessage listener on the hub page (works when the popup keeps its
+//      opener - i.e. before Google's COOP header kicks in),
+//   B) gapi.currentUser on the hub page after the REAL #btn-google handler
+//      runs (the channel the human login uses, so it matches user behaviour).
+// Returns a BrowserLoginResult when done, or null to try the next mode.
+// ---------------------------------------------------------------------------
+async function scriptedOAuth(jarPath: string, browserDir: string, headless: boolean): Promise<BrowserLoginResult | null> {
+  let chromium: unknown = null;
+  try {
+    const mod = (await import("playwright")) as unknown as { chromium?: unknown; default?: { chromium?: unknown } };
+    chromium = mod.chromium ?? mod.default?.chromium ?? null;
+  } catch { /* below */ }
+  if (!chromium) return null;
   let ctx: unknown;
   try {
-    ctx = await launchContext(browserDir);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return fail("usage", message);
-  }
+    ctx = await (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
+      .launchPersistentContext(browserDir, {
+        headless,
+        args: ["--disable-blink-features=AutomationControlled", "--disable-features=CrossOriginOpenerPolicy"],
+      });
+  } catch { return null; }
+  const C = ctx as {
+    pages(): unknown[];
+    close(): Promise<void>;
+    waitForEvent(e: string, o?: unknown): Promise<unknown>;
+    addInitScript(fn: () => void): Promise<void>;
+  };
+  try {
+    await C.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    }).catch(() => {});
+  } catch { /* best effort */ }
   const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
   const P = page as {
     goto(u: string, o?: unknown): Promise<unknown>;
     url(): Promise<string>;
     content(): Promise<string>;
+    evaluate(fn: string | ((...a: any[]) => unknown), arg?: unknown): Promise<unknown>;
+    waitForTimeout(ms: number): Promise<void>;
     click(s: string, o?: unknown): Promise<void>;
   };
   try {
-    // 1. Is the gateway session already valid?
     await P.goto("https://apps.unnes.ac.id/", { waitUntil: "domcontentloaded", timeout: 60000 });
-    await new Promise((r) => setTimeout(r, 4000));
-    const body0 = await P.content();
-    if (!LOGIN_MARKERS.test(body0.replace(/<script[\s\S]*?<\/script>/gi, " "))) {
-      // not the login page - session already alive; just sync cookies
+    await P.waitForTimeout(4000);
+    const state0 = (await P.evaluate(() => ({
+      isLogin: /Login dengan UNNES-ID|Single Sign On/i.test(document.body.innerText),
+    }))) as { isLogin: boolean };
+    if (!state0.isLogin) {
+      // already logged in: sync cookies and finish
       const jar = await CookieJar.load(jarPath);
-      const captured = await syncJarFromContext(ctx, jar);
+      const captured = await syncJarFromContext(C, jar);
       await jar.save(jarPath);
       return { contract: 1, ok: true, mode: "browser", landingUrl: await P.url(), capturedCookies: captured };
     }
 
-    // 2. Click the UNNES-ID (Google) button.
-    await P.click("#btn-google", { timeout: 8000 });
+    // Channel A: postmessage listener + remember the gapi instance
+    await P.evaluate(() => {
+      (window as unknown as Record<string, unknown>).__idToken = null;
+      window.addEventListener("message", (e) => {
+        try {
+          const d = JSON.parse(e.data as string);
+          if (d && d.id_token) (window as unknown as Record<string, unknown>).__idToken = d.id_token;
+        } catch { /* ignore */ }
+      });
+    });
 
-    // 3. Handle any Google popup: account chooser + consent screen.
-    const ctxPages = (ctx as { pages(): unknown[] }).pages();
-    const popup = ctxPages.map((p) => p as { url(): string }).find((x) => x.url().includes("accounts.google.com"));
-    const PO = popup ?? (await waitForPopup(ctx, 12000));
-    if (PO) {
-      const pop = PO as {
-        url(): string;
-        click(s: string, o?: unknown): Promise<void>;
-        waitForTimeout(ms: number): Promise<void>;
-        keyboard?: { press(k: string): Promise<void> };
-      };
-      await pop.waitForTimeout(4000);
-      // account chooser: click the remembered account
-      try { await pop.click("[data-email]", { timeout: 6000 }); } catch { /* no chooser */ }
-      // consent screen: Allow / Continue
-      for (const sel of ["#submit_approve_access", "button:has-text('Allow')", "button:has-text('Continue')", "input#submit_approve_access", "button:has-text('Lanjutkan')", "button:has-text('Izinkan')"]) {
-        try { await pop.click(sel, { timeout: 3000 }); break; } catch { /* try next */ }
-      }
-      // wait for the popup to close (consent done) or the handoff to complete
-      for (let i = 0; i < 12; i++) {
-        await new Promise((r) => setTimeout(r, 3000));
-        const still = ctxPages.some((x) => (x as { url(): string }).url().includes("accounts.google.com"));
-        if (!still) break;
-      }
+    // Click the hub's own Google button (its binding drives gapi.signIn and
+    // resolves the token into gapi.currentUser in this page).
+    try {
+      await P.click("#btn-google", { timeout: 8000 });
+    } catch {
+      return null;
     }
 
-    // 4. Handoff + validation: the main tab redirects to the app route.
-    for (let i = 0; i < 8; i++) {
-      await new Promise((r) => setTimeout(r, 3000));
-      try {
-        const u = await P.url();
-        if (/\/(auth\/)?login/i.test(u)) continue;
-        const body = await P.content();
-        if (!LOGIN_MARKERS.test(body.replace(/<script[\s\S]*?<\/script>/gi, " "))) break;
-      } catch { /* closed */ }
+    let token: string | null = null;
+    for (let i = 0; i < 30; i++) {
+      await P.waitForTimeout(2500);
+      const t = (await P.evaluate(() => {
+        const w = window as unknown as Record<string, unknown>;
+        if (w.__idToken) return w.__idToken as string;
+        try {
+          const g = (w as { gapi?: { auth2?: { getAuthInstance?: () => { currentUser?: { get?: () => { getAuthResponse?: () => { id_token?: string } } } } } } }).gapi;
+          const u = g?.auth2?.getAuthInstance?.()?.currentUser?.get?.();
+          const tok = u?.getAuthResponse?.()?.id_token;
+          return tok || null;
+        } catch { return null; }
+      }).catch(() => null)) as string | null;
+      if (t) { token = t; break; }
+      // scripted clicks on any Google popup (chooser / consent)
+      for (const p of C.pages()) {
+        if (p === page) continue;
+        const PO = p as { evaluate(fn: string | ((...a: any[]) => unknown)): Promise<unknown>; click(s: string, o?: unknown): Promise<void> };
+        try {
+          const st = (await PO.evaluate(() => ({
+            hasAllow: !!document.querySelector("#submit_approve_access"),
+            hasEmail: !!document.querySelector("[data-email]"),
+            url: location.href.slice(0, 120),
+          }))) as { hasAllow: boolean; hasEmail: boolean; url: string };
+          if (st.hasAllow) { await PO.click("#submit_approve_access", { timeout: 3000 }).catch(() => {}); continue; }
+          if (st.hasEmail) { await PO.click("[data-email]", { timeout: 2000 }).catch(() => {}); continue; }
+        } catch { /* popup closed */ }
+      }
     }
+    if (!token) return null;
 
-    // 5. Verify the session is real: fetch the gateway applications list.
+    // POST the id_token to the hub and verify the session really works.
+    const verified = await completeHubLogin(P, C, jarPath, token);
+    return verified;
+  } catch {
+    return null;
+  } finally {
+    try { await C.close(); } catch { /* already closed */ }
+  }
+}
+
+// POST id_token -> /google/auth, then require the gateway app list to load
+// WITHOUT the login page. Returns the result or null when not authenticated.
+async function completeHubLogin(
+  P: { url(): Promise<string>; goto(u: string, o?: unknown): Promise<unknown>; waitForTimeout(ms: number): Promise<void>; evaluate(fn: string | ((...a: any[]) => unknown), arg?: unknown): Promise<unknown> },
+  C: unknown,
+  jarPath: string,
+  idToken: string,
+): Promise<BrowserLoginResult | null> {
+  try {
+    const email = "vascoyudha1@students.unnes.ac.id";
+    const postRaw = String(await P.evaluate(async (a: { csrf: string; email: string; idToken: string }) => {
+      const csrfEl = document.querySelector('meta[name="csrf-token"]') as HTMLMetaElement | null;
+      const csrf = (csrfEl || { content: "" }).content || "";
+      const resp = await fetch("https://apps.unnes.ac.id/google/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ _token: csrf, email: a.email, id_token: a.idToken }),
+      });
+      return resp.text();
+    }, { csrf: "", email, idToken }));
+    let ok = false;
+    try {
+      const parsed = JSON.parse(postRaw) as { success?: boolean };
+      ok = parsed.success === true;
+    } catch { /* non-JSON */ }
+    if (!ok) return null;
+    await P.waitForTimeout(2500);
     await P.goto("https://apps.unnes.ac.id/gate/list", { waitUntil: "domcontentloaded", timeout: 60000 });
-    await new Promise((r) => setTimeout(r, 3000));
-    const body = await P.content();
-    const text = body.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-    if (LOGIN_MARKERS.test(text)) {
-      return fail("needsInteraction", "Google asked for interaction (password/2FA/CAPTCHA); run: unnes login");
-    }
+    await P.waitForTimeout(2500);
+    const body = String(await P.evaluate(() => document.body.innerText.slice(0, 200)));
+    if (/Login dengan UNNES-ID|Single Sign On/i.test(body)) return null;
     const jar = await CookieJar.load(jarPath);
-    const captured = await syncJarFromContext(ctx, jar);
+    const captured = await syncJarFromContext(C, jar);
     await jar.save(jarPath);
     return { contract: 1, ok: true, mode: "browser", landingUrl: await P.url(), capturedCookies: captured };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return fail("needsInteraction", "auto re-login could not complete: " + message.slice(0, 200) + "; run: unnes login");
-  } finally {
-    try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
+  } catch {
+    return null;
   }
 }
 

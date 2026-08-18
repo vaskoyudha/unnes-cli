@@ -373,13 +373,16 @@ fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
     };
     // Auto re-login for status: try the scripted login before declaring EXPIRED.
     if !valid && cfg.general.auto_relogin {
-        let _ = watch::auto_login(home, profile);
+        probe_err = match watch::auto_login(home, profile) {
+            Ok(how) => format!("re-login ok ({how})"),
+            Err(e) => format!("auto re-login failed: {e:#}"),
+        };
         let mut job = fetcher::job("get", profile);
         job["url"] = json!("https://apps.unnes.ac.id/gate/list");
         if let Ok(res) = fetcher::run_job(home, profile, job) {
             valid = res.ok && !res.session_expired;
-            if res.session_expired {
-                probe_err = "gateway session ended".into();
+            if valid {
+                probe_err = "re-login ok".into();
             }
         }
     }

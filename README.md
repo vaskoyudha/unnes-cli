@@ -121,6 +121,10 @@ unnes data export <page> --csv   (or --json for the full history)
 The gateway embeds every app behind a short-lived JWT (sso_token) and each app
 has its own session exchange:
 
+- Sikadu 2.4 (app 23, duanol.unnes.ac.id/v2): the real academic portal - KRS
+  form (courses, SKS, schedule, IPK), profile; primed via the gateway iframe in
+  the persistent browser session (render/batch with ssoApp=23), then the .aspx
+  pages are server-rendered and fetchable.
 - Akademik (app 76, akademik.unnes.ac.id): GET+POST /auth/sso_login with the
   token (plain HTTP, op=sso; auto-run on session expiry). Data pages (KRS,
   Hasil Studi) are Livewire -> render=true uses the persistent browser session.
