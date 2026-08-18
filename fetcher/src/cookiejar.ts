@@ -114,6 +114,11 @@ export class CookieJar {
     return parts.length ? parts.join("; ") : null;
   }
 
+  /** All distinct cookie names currently in the jar. */
+  cookieNames(): string[] {
+    return [...new Set(this.cookies.map((c) => c.name))];
+  }
+
   /** First value among the named cookies (used for XSRF-TOKEN lookups). */
   cookieValue(names: string[], url: URL): string | null {
     for (const c of this.cookies) {

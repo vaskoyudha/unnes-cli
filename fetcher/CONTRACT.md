@@ -59,6 +59,13 @@ network | timeout | csrf | login | usage | contract | internal.
 - get: sessionExpired when a non-login URL lands on /auth/login or 401;
   the CLI then tells the user to re-run login (SSO cannot auto re-login).
 - challenge: heuristic for Cloudflare 403 challenge pages; CLI backs off.
+- op=sso: exchange the gateway sso_token for an app session (app 76/64:
+  GET+POST auth/sso_login; app 30: gateway iframe exchange + semester choice).
+  op=get auto-runs it once on session expiry for known app hosts.
+- op=page: render a JS-driven page (Livewire) in the persistent browser session
+  and extract records; op=crawl: follow link_selector from a start page and
+  extract pageExtract rows per linked page (adds _source/_title). Both sync
+  every *.unnes.ac.id cookie back into the jar.
 - No retries/caching/JS rendering for plain HTTP ops - the Rust side drives
   all policy.
 

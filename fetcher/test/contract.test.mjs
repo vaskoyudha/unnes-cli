@@ -270,6 +270,55 @@ test("browser login respects UNNES_NO_BROWSER (no browser launched)", async () =
   });
 });
 
+
+test("page render respects UNNES_NO_BROWSER (no browser launched)", async () => {
+  await withHome("nopagerender", async () => {
+    process.env.UNNES_NO_BROWSER = "1";
+    try {
+      const res = await processJob({
+        contract: 1,
+        op: "page",
+        url: "https://akademik.unnes.ac.id/krs-mahasiswa",
+        ssoApp: "76",
+        extract: { selector: "tbody tr" },
+      });
+      assert.equal(res.ok, false);
+      assert.equal(res.error.code, "usage");
+      assert.match(res.error.message, /UNNES_NO_BROWSER/);
+    } finally {
+      delete process.env.UNNES_NO_BROWSER;
+    }
+  });
+});
+
+test("sso op rejects unknown gateway apps without network", async () => {
+  await withHome("sso-unknown", async () => {
+    const res = await processJob({
+      contract: 1,
+      op: "sso",
+      appId: "999",
+      baseUrl: "https://apps.unnes.ac.id",
+    });
+    assert.equal(res.ok, false);
+    assert.equal(res.error.code, "usage");
+    assert.match(res.error.message, /unknown gateway app/);
+  });
+});
+
+test("sso op reports gateway session expiry without a jar", async () => {
+  await withHome("sso-nosession", async () => {
+    const res = await processJob({
+      contract: 1,
+      op: "sso",
+      appId: "76",
+      baseUrl: "http://127.0.0.1:1", // unreachable: no gateway session possible
+    });
+    assert.equal(res.ok, false);
+    // network error surfaces from the gateway fetch (no jar, unreachable host)
+    assert.ok(["network", "session"].includes(res.error.code));
+  });
+});
+
 test("contract versions other than 1 are rejected", async () => {
   await withHome("contract", async (home) => {
     const res = await processJob({

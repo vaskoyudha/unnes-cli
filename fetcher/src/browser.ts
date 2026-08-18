@@ -249,3 +249,317 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     return fail("internal", "browser login failed: " + message);
   }
 }
+
+// ---------------------------------------------------------------------------
+// op: page - render a JS-driven page in the persistent browser session and
+// extract records from the live DOM. Used for Livewire pages (akademik KRS,
+// schedules) and for portals whose SSO needs the browser iframe protocol
+// (Elena). The browser profile already holds the gateway session; the app's
+// iframe exchange runs naturally, and afterwards every *.unnes.ac.id cookie
+// is copied back into the jar so later plain-HTTP fetches also work.
+// ---------------------------------------------------------------------------
+
+export interface RenderPageOpts {
+  url: string;
+  /** gateway app id to prime first (e.g. "76" for akademik, "30" for elena) */
+  ssoApp?: string;
+  /** URL to visit before the target (e.g. the akademik semester switcher) */
+  preUrl?: string;
+  /** elena semester to open after SSO (default 20261, current) */
+  semester?: string;
+  extract?: { selector: string; fields?: Record<string, string> };
+  /** max ms to wait for the extract selector; default 15000 */
+  waitMs?: number;
+  hubUrl?: string;
+}
+
+export interface RenderPageResult {
+  contract: number;
+  ok: boolean;
+  op: "page";
+  status?: number;
+  finalUrl: string | null;
+  sessionExpired: boolean;
+  records: Record<string, string>[];
+  capturedCookies: number;
+  error?: { code: string; message: string };
+  [k: string]: unknown;
+}
+
+const LOGIN_MARKERS = /login dengan unnes-id|masukan email dan password|username\s+password|kebijakan privasi/i;
+
+async function launchContext(browserDir: string): Promise<unknown> {
+  const chromium = await import("playwright").then(
+    (m) => (m as unknown as { chromium?: unknown; default?: { chromium?: unknown } }).chromium
+      ?? (m as unknown as { default?: { chromium?: unknown } }).default?.chromium,
+    () => null,
+  );
+  if (!chromium) throw new Error("playwright is not installed; run: cd fetcher && npm ci && npx playwright install chromium");
+  try {
+    mkdirSync(browserDir, { recursive: true });
+    chmodSync(browserDir, 0o700);
+  } catch { /* best effort */ }
+  return (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
+    .launchPersistentContext(browserDir, { headless: true });
+}
+
+/** Copy every *.unnes.ac.id cookie from the browser context into the jar. */
+async function syncJarFromContext(ctx: unknown, jar: CookieJar): Promise<number> {
+  const cookies = await (ctx as { cookies(): Promise<PlaywrightCookie[]> }).cookies();
+  let n = 0;
+  for (const c of cookies) {
+    if (!c.domain.endsWith("unnes.ac.id")) continue;
+    jar.addCookie({
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path,
+      secure: c.secure,
+      httpOnly: c.httpOnly,
+      expires: c.expires === -1 ? null : c.expires * 1000,
+    });
+    n += 1;
+  }
+  return n;
+}
+
+
+/**
+ * Complete the Elena (app 30) session handshake inside the persistent
+ * browser. The gateway iframe exchange alone only primes elena_gateway_session;
+ * the final MoodleSession is established by:
+ *   1. clicking the semester button (#btnKlik_<semester>) in the login_sso iframe,
+ *   2. the parent frame navigating to /portal/apis/login_url/<semester>,
+ *   3. clicking #btnTest ("continue") on that page,
+ * which lands on elena /my/ with an authenticated Moodle session.
+ * Verified against the live portal (2026-08).
+ */
+async function completeElenaSession(
+  page: { url(): Promise<string>; frames(): { url(): Promise<string>; click(s: string, o?: unknown): Promise<void> }[]; click(s: string, o?: unknown): Promise<void> },
+  semester: string,
+): Promise<void> {
+  try {
+    for (const f of page.frames()) {
+      let u = "";
+      try { u = await f.url(); } catch { continue; }
+      if (u.includes("login_sso")) {
+        try { await f.click("#btnKlik_" + semester, { timeout: 5000 }); } catch { /* semester button missing */ }
+        break;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+    try { await page.click("#btnTest", { timeout: 5000 }); } catch { /* continue button missing */ }
+    await new Promise((r) => setTimeout(r, 6000));
+  } catch { /* best effort: session may already be established */ }
+}
+
+export async function renderPage(jarPath: string, browserDir: string, opts: RenderPageOpts): Promise<RenderPageResult> {
+  const base = {
+    contract: 1, ok: false as boolean, op: "page" as const,
+    finalUrl: null as string | null, sessionExpired: false, records: [] as Record<string, string>[], capturedCookies: 0,
+  };
+  if (process.env.UNNES_NO_BROWSER) {
+    return { ...base, error: { code: "usage", message: "page render disabled via UNNES_NO_BROWSER" } };
+  }
+  let ctx: unknown;
+  try {
+    ctx = await launchContext(browserDir);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ...base, error: { code: "usage", message: message } };
+  }
+  const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
+  try {
+    const hub = opts.hubUrl ?? "https://apps.unnes.ac.id";
+    if (opts.ssoApp) {
+      await (page as { goto(u: string, o?: unknown): Promise<unknown> }).goto(hub + "/" + opts.ssoApp, { waitUntil: "domcontentloaded", timeout: 60000 });
+      // the app's iframe exchange runs client-side; give it a moment
+      await new Promise((r) => setTimeout(r, 6000));
+      let loginUrl = "";
+      let loginBody = "";
+      try {
+        loginUrl = await (page as { url(): Promise<string> }).url();
+        loginBody = await (page as { content(): Promise<string> }).content();
+      } catch { /* closed */ }
+      if (/\/(auth\/)?login/i.test(loginUrl) || LOGIN_MARKERS.test(loginBody.replace(/<script[\s\S]*?<\/script>/gi, " "))) {
+        return { ...base, sessionExpired: true, error: { code: "session", message: "gateway session expired; run: unnes login" } };
+      }
+    }
+    if (opts.ssoApp === "30") {
+      await completeElenaSession(page as never, opts.semester ?? "20261");
+    }
+    if (opts.preUrl) {
+      await (page as { goto(u: string, o?: unknown): Promise<unknown> }).goto(opts.preUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await new Promise((r) => setTimeout(r, 2500));
+    }
+    await (page as { goto(u: string, o?: unknown): Promise<unknown> }).goto(opts.url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    if (opts.extract?.selector) {
+      try {
+        await (page as { waitForSelector(s: string, o?: unknown): Promise<unknown> })
+          .waitForSelector(opts.extract.selector, { timeout: opts.waitMs ?? 15000 });
+      } catch { /* zero matches is a valid outcome (empty records) */ }
+    }
+    const html = await (page as { content(): Promise<string> }).content();
+    let finalUrl = "";
+    try { finalUrl = await (page as { url(): Promise<string> }).url(); } catch { /* closed */ }
+
+    const jar = await CookieJar.load(jarPath);
+    const captured = await syncJarFromContext(ctx, jar);
+    await jar.save(jarPath);
+
+    // Session health: target redirected back to the gateway login, or the
+    // gateway's login page (has the UNNES-ID button) is showing.
+    const body = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
+    const landedOnGateway = finalUrl.startsWith("https://apps.unnes.ac.id");
+    const sessionExpired = (landedOnGateway && LOGIN_MARKERS.test(body)) || /\/auth\/login/i.test(finalUrl);
+    if (sessionExpired) {
+      return { ...base, finalUrl, sessionExpired: true, capturedCookies: captured, error: { code: "session", message: "session expired; run: unnes login" } };
+    }
+
+    let records: Record<string, string>[] = [];
+    if (opts.extract) {
+      const { extractRecords } = await import("./extract.js");
+      records = extractRecords(html, opts.extract);
+    }
+    return { ...base, ok: true, finalUrl, records, capturedCookies: captured };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ...base, error: { code: "network", message: "page render failed: " + message } };
+  } finally {
+    try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// op: crawl - follow links from a listing page and extract records from each
+// linked page (bounded). This powers "for every mata kuliah": e.g. Elena
+// /my/ -> each course page -> .activityinstance rows (assignments included).
+// Records are merged with _source (the page URL) and _title (link text).
+// ---------------------------------------------------------------------------
+
+export interface CrawlOpts {
+  startUrl: string;
+  /** selector yielding the <a> elements to follow (same-origin *.unnes.ac.id) */
+  linkSelector: string;
+  /** extraction applied to each linked page */
+  pageExtract: { selector: string; fields?: Record<string, string> };
+  /** gateway app to prime first */
+  ssoApp?: string;
+  /** URL to visit before the start page (e.g. semester switcher) */
+  preUrl?: string;
+  /** elena semester to open after SSO (default 20261, current) */
+  semester?: string;
+  waitMs?: number;
+  /** max links to follow; default 50 */
+  maxLinks?: number;
+  hubUrl?: string;
+}
+
+export interface CrawlResult {
+  contract: number;
+  ok: boolean;
+  op: "crawl";
+  finalUrl: string | null;
+  sessionExpired: boolean;
+  followed: number;
+  records: Record<string, string>[];
+  error?: { code: string; message: string };
+  [k: string]: unknown;
+}
+
+export async function crawlPage(jarPath: string, browserDir: string, opts: CrawlOpts): Promise<CrawlResult> {
+  const base = {
+    contract: 1, ok: false as boolean, op: "crawl" as const,
+    finalUrl: null as string | null, sessionExpired: false, followed: 0, records: [] as Record<string, string>[],
+  };
+  if (process.env.UNNES_NO_BROWSER) {
+    return { ...base, error: { code: "usage", message: "crawl disabled via UNNES_NO_BROWSER" } };
+  }
+  let ctx: unknown;
+  try {
+    ctx = await launchContext(browserDir);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ...base, error: { code: "usage", message } };
+  }
+  const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
+  const P = page as {
+    goto(u: string, o?: unknown): Promise<unknown>;
+    url(): Promise<string>;
+    content(): Promise<string>;
+    waitForSelector(s: string, o?: unknown): Promise<unknown>;
+    evaluate(fn: string): Promise<unknown>;
+  };
+  const maxLinks = opts.maxLinks ?? 50;
+  try {
+    const hub = opts.hubUrl ?? "https://apps.unnes.ac.id";
+    if (opts.ssoApp) {
+      await P.goto(hub + "/" + opts.ssoApp, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await new Promise((r) => setTimeout(r, 6000));
+      let u = "";
+      let uBody = "";
+      try {
+        u = await P.url();
+        uBody = await P.content();
+      } catch { /* closed */ }
+      if (/\/(auth\/)?login/i.test(u) || LOGIN_MARKERS.test(uBody.replace(/<script[\s\S]*?<\/script>/gi, " "))) {
+        return { ...base, sessionExpired: true, error: { code: "session", message: "gateway session expired; run: unnes login" } };
+      }
+    }
+
+    if (opts.ssoApp === "30") {
+      await completeElenaSession(page as never, opts.semester ?? "20261");
+    }
+    if (opts.preUrl) {
+      await P.goto(opts.preUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await new Promise((r) => setTimeout(r, 2500));
+    }
+    await P.goto(opts.startUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    {
+      const st = await P.content();
+      if (LOGIN_MARKERS.test(st.replace(/<script[\s\S]*?<\/script>/gi, " ")) && /apps\.unnes\.ac\.id/.test(await P.url())) {
+        return { ...base, sessionExpired: true, error: { code: "session", message: "session expired; run: unnes login" } };
+      }
+    }
+    try {
+      await P.waitForSelector(opts.linkSelector, { timeout: opts.waitMs ?? 15000 });
+    } catch {
+      return { ...base, finalUrl: await safeUrl(P), records: [], error: { code: "usage", message: "no links matched selector '" + opts.linkSelector + "' on " + opts.startUrl } };
+    }
+    // Collect absolute same-origin links.
+    const links = (await P.evaluate(
+      "(function(){var out=[];var seen={};document.querySelectorAll(SEL).forEach(function(a){var h=a.href||a.getAttribute('href');if(!h)return;var u=new URL(h,location.href);if(!/unnes\\.ac\\.id$/.test(u.hostname)&&u.hostname!=='elena.unnes.ac.id'&&u.hostname!=='akademik.unnes.ac.id'&&u.hostname!=='student.unnes.ac.id')return;if(seen[u.href])return;seen[u.href]=1;out.push({href:u.href,text:(a.innerText||a.textContent||'').replace(/\\s+/g,' ').trim().slice(0,120)});});return out;})()"
+        .replace("SEL", JSON.stringify(opts.linkSelector)),
+    )) as { href: string; text: string }[];
+
+    const { extractRecords } = await import("./extract.js");
+    const records: Record<string, string>[] = [];
+    const waitMs = opts.waitMs ?? 15000;
+    for (const link of links.slice(0, maxLinks)) {
+      try {
+        await P.goto(link.href, { waitUntil: "domcontentloaded", timeout: 60000 });
+      } catch { continue; }
+      try {
+        await P.waitForSelector(opts.pageExtract.selector, { timeout: waitMs });
+      } catch { continue; } // page without matches: skip
+      const html = await P.content();
+      const recs = extractRecords(html, opts.pageExtract);
+      for (const r of recs) {
+        records.push({ ...r, _source: link.href, _title: link.text });
+      }
+    }
+    const jar = await CookieJar.load(jarPath);
+    await syncJarFromContext(ctx, jar);
+    await jar.save(jarPath);
+    return { ...base, ok: true, finalUrl: await safeUrl(P), followed: Math.min(links.length, maxLinks), records };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ...base, error: { code: "network", message: "crawl failed: " + message } };
+  } finally {
+    try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
+  }
+}
+
+async function safeUrl(P: { url(): Promise<string> }): Promise<string | null> {
+  try { return await P.url(); } catch { return null; }
+}

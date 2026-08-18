@@ -59,6 +59,24 @@ pub struct Page {
     /// Extra regex patterns (Rust regex syntax) stripped before hashing.
     #[serde(default)]
     pub normalize: Vec<String>,
+    /// Render the page in the persistent browser session first (Livewire /
+    /// iframe-SSO apps like akademik KRS or Elena) instead of plain HTTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render: Option<bool>,
+    /// Gateway app id to prime the app session (76 = akademik, 30 = elena,
+    /// 64 = student portal) before fetching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sso_app: Option<String>,
+    /// Crawl mode: selector yielding the <a> links to follow from this page;
+    /// each linked page is fetched (render) and its rows become records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_selector: Option<String>,
+    /// URL visited before the target (e.g. the akademik semester switcher).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_url: Option<String>,
+    /// elena semester to open after SSO (default 20261, current Gasal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sso_semester: Option<String>,
 }
 
 impl Default for General {

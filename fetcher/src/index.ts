@@ -8,7 +8,7 @@ import { ExtractSpec, extractRecords } from "./extract.js";
 
 export interface Job {
   contract: number;
-  op: "get" | "login" | "logout";
+  op: "get" | "login" | "logout" | "sso" | "page" | "crawl";
   profile?: string;
   /** used by login/logout when the job URL family is not explicit */
   baseUrl?: string;
@@ -18,6 +18,20 @@ export interface Job {
   form?: LoginForm;
   extract?: ExtractSpec;
   extraRegexes?: string[];
+  /** op=sso: gateway app id (76 = akademik, 64 = student, 30 = elena) */
+  appId?: string;
+  /** op=page: gateway app to prime before rendering (e.g. "76", "30") */
+  ssoApp?: string;
+  /** op=page: max ms to wait for the extract selector */
+  waitMs?: number;
+  /** op=crawl: selector yielding the <a> links to follow */
+  linkSelector?: string;
+  /** op=crawl: max links to follow */
+  maxLinks?: number;
+  /** op=page/crawl: URL to visit before the target (e.g. semester switcher) */
+  preUrl?: string;
+  /** op=page/crawl (elena): semester to open after SSO, default 20261 */
+  semester?: string;
 }
 
 export interface JobResult {
@@ -25,7 +39,7 @@ export interface JobResult {
 }
 
 const CONTRACT = 1;
-const DEFAULT_BASE = "https://student.unnes.ac.id";
+const DEFAULT_BASE = "https://apps.unnes.ac.id";
 
 function fail(code: string, message: string): JobResult {
   return { contract: CONTRACT, ok: false, error: { code, message } };
@@ -38,44 +52,115 @@ async function envPaths(): Promise<{ profilePath: string; browserDir: string }> 
     profilePath: join(home, "profiles", profile + ".json"),
     // Persistent Chromium profile: keeps the Google sign-in state (account
     // choice, 2FA trust) so later browser logins are one click instead of a
-    // full re-auth. Only used by op=login mode=browser.
+    // full re-auth. Used by op=login mode=browser and op=page rendering.
     browserDir: join(home, "browser-profiles", profile),
   };
+}
+
+/** Run an sso exchange (gateway token -> app session) for the given app. */
+async function refreshAppSession(
+  profilePath: string,
+  baseUrl: string,
+  appId: string,
+): Promise<{ ok: boolean; code?: string; message?: string }> {
+  const { opSso } = await import("./sso.js");
+  const res = await opSso(profilePath, baseUrl, appId);
+  return res.ok ? { ok: true } : { ok: false, code: res.error?.code, message: res.error?.message };
 }
 
 export async function processJob(job: Job): Promise<JobResult> {
   if (job.contract !== CONTRACT) return fail("contract", "unsupported contract version " + String(job.contract));
   const { profilePath, browserDir } = await envPaths();
-  const jar = await CookieJar.load(profilePath);
   const ua = process.env.UNNES_USER_AGENT ?? "unnes-cli/0.1";
-  const f = new HttpFetcher(jar, ua);
   const baseUrl = (job.baseUrl ?? DEFAULT_BASE).replace(/\/+$/, "");
 
   switch (job.op) {
     case "get": {
       if (!job.url) return fail("usage", "op=get requires url");
-      const res = await f.request({ method: "GET", url: job.url });
-      if (res.fetchError) return fail(res.fetchError.code, res.fetchError.message);
-      const records = job.extract ? extractRecords(res.html, job.extract) : [];
-      const normalized = normalizeHtml(res.html, job.extraRegexes ?? []);
-      return {
-        contract: CONTRACT, op: "get", ok: true, status: res.status, finalUrl: res.finalUrl,
-        sessionExpired: res.sessionExpired, challenge: res.challenge, retryAfter: res.retryAfter,
-        records, normalized,
+      const doGet = async (): Promise<JobResult> => {
+        const jar = await CookieJar.load(profilePath);
+        const f = new HttpFetcher(jar, ua);
+        const res = await f.request({ method: "GET", url: job.url! });
+        if (res.fetchError) return fail(res.fetchError.code, res.fetchError.message);
+        const records = job.extract ? extractRecords(res.html, job.extract) : [];
+        const normalized = normalizeHtml(res.html, job.extraRegexes ?? []);
+        return {
+          contract: CONTRACT, op: "get", ok: true, status: res.status, finalUrl: res.finalUrl,
+          sessionExpired: res.sessionExpired, challenge: res.challenge, retryAfter: res.retryAfter,
+          records, normalized,
+        };
       };
+      let result = await doGet();
+      // Auto SSO bootstrap: the session expired for a known data subdomain -
+      // exchange the gateway token once, then retry.
+      if (result.ok && result.sessionExpired === true && job.url) {
+        const { appForHost } = await import("./sso.js");
+        try {
+          const cfg = appForHost(new URL(job.url).hostname);
+          if (cfg) {
+            const refreshed = await refreshAppSession(profilePath, baseUrl, cfg.appId);
+            if (refreshed.ok) {
+              const retry = await doGet();
+              if (retry.ok && retry.sessionExpired !== true) {
+                retry.ssoRefreshed = true;
+                return retry;
+              }
+            }
+          }
+        } catch { /* fall through to the original result */ }
+      }
+      return result;
+    }
+    case "sso": {
+      if (!job.appId) return fail("usage", "op=sso requires appId");
+      const { opSso } = await import("./sso.js");
+      return opSso(profilePath, baseUrl, job.appId);
+    }
+    case "page": {
+      if (!job.url) return fail("usage", "op=page requires url");
+      const { renderPage } = await import("./browser.js");
+      return renderPage(profilePath, browserDir, {
+        url: job.url,
+        ssoApp: job.ssoApp,
+        preUrl: job.preUrl,
+        semester: job.semester,
+        extract: job.extract,
+        waitMs: job.waitMs,
+      });
+    }
+    case "crawl": {
+      if (!job.url || !job.linkSelector || !job.extract) {
+        return fail("usage", "op=crawl requires url, linkSelector and extract");
+      }
+      const { crawlPage } = await import("./browser.js");
+      return crawlPage(profilePath, browserDir, {
+        startUrl: job.url,
+        linkSelector: job.linkSelector,
+        pageExtract: job.extract,
+        ssoApp: job.ssoApp,
+        preUrl: job.preUrl,
+        semester: job.semester,
+        waitMs: job.waitMs,
+        maxLinks: job.maxLinks,
+      });
     }
     case "login": {
       if (job.mode === "browser") {
         // Google SSO lives on the apps.unnes.ac.id hub - never job.baseUrl,
-        // which is the DATA portal and has no Google sign-in.
+        // which is the data portal and has no Google sign-in.
         const { browserLogin } = await import("./browser.js");
         return browserLogin(profilePath, browserDir);
       }
       if (!job.form) return fail("usage", "op=login requires form{email,password}");
+      const jar = await CookieJar.load(profilePath);
+      const f = new HttpFetcher(jar, ua);
       return opLogin(f, baseUrl, profilePath, jar, job.form);
     }
-    case "logout":
+    case "logout": {
+      const jar = await CookieJar.load(profilePath);
+      const f = new HttpFetcher(jar, ua);
       return opLogout(f, baseUrl, jar, profilePath);
+    }
     default:
       return fail("usage", "unknown op " + String((job as { op?: string }).op));
   }

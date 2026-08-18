@@ -309,17 +309,42 @@ fn cmd_fetch(home: &UnnesHome, profile: &str, page_id: &str, csv: bool, json_out
         return Err(app_err(3, format!("not logged in (profile {profile}); run: unnes login")));
     }
 
-    let mut job = fetcher::job("get", profile);
+    // render=true pages (Livewire / iframe-SSO apps) go through the
+    // persistent browser session; everything else is plain HTTP with an
+    // automatic sso_token exchange on session expiry. link_selector pages
+    // become crawls (follow links, extract rows on each linked page).
+    let mut job = if page.link_selector.is_some() {
+        fetcher::job("crawl", profile)
+    } else if page.render.unwrap_or(false) {
+        fetcher::job("page", profile)
+    } else {
+        fetcher::job("get", profile)
+    };
     job["url"] = json!(page.url);
     if let Some(sel) = &page.selector {
         job["extract"] = json!({ "selector": sel });
     }
+    if let Some(sel) = &page.link_selector {
+        job["linkSelector"] = json!(sel);
+    }
+    if let Some(pre) = &page.pre_url {
+        job["preUrl"] = json!(pre);
+    }
+    if let Some(sem) = &page.sso_semester {
+        job["semester"] = json!(sem);
+    }
     if !page.normalize.is_empty() {
         job["extraRegexes"] = json!(page.normalize);
+    }
+    if let Some(app) = &page.sso_app {
+        job["ssoApp"] = json!(app);
     }
     let res = fetcher::run_job(home, profile, job)?;
     if !res.ok {
         let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
+        if code == "session" {
+            return Err(app_err(4, format!("session expired while fetching '{page_id}'; run: unnes login")));
+        }
         return Err(app_err(err_code_for(&code), format!("fetch {page_id}: {}", err_msg(&res))));
     }
     if res.session_expired {

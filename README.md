@@ -1,7 +1,8 @@
 # unnes-cli
 
-A headless, cron-friendly CLI for the **UNNES student portal** (student.unnes.ac.id,
-authenticated via the Google SSO hub at apps.unnes.ac.id):
+A headless, cron-friendly CLI for the **UNNES ecosystem**: Google SSO hub
+(apps.unnes.ac.id) with app sessions for Sikadu/Akademik (akademik.unnes.ac.id)
+and the Elena e-learning portal (elena.unnes.ac.id):
 
 - **Login** once via Google SSO (a Chromium window opens, you sign in, the session
   cookie jar is captured). Everything after that is plain HTTP and headless.
@@ -27,6 +28,7 @@ A TUI is explicitly out of v1.
 | M1 core Rust (config/paths/output/diff/changelog) | done (22 tests) |
 | M2 Node/TS fetcher arm | done (11 contract tests) |
 | M3 session (login/status/logout/fetch) | done - Google SSO login, exit codes 0-6 |
+| M3b portal scraping (sso exchange, render, crawl) | done - akademik + elena sessions, per-mata-kuliah crawl |
 | M4 watch engine + daemon | todo |
 | M5 release v0.1.0 + docs | todo |
 
@@ -61,12 +63,30 @@ uploaded or committed (gitignored).
 Exit codes: 0 ok, 1 generic, 2 usage, 3 not logged in, 4 session expired,
 5 network/429/challenge, 6 selector matched nothing (page may have changed).
 
+## Scraping mechanism (verified against the live portal)
+
+The gateway embeds every app behind a short-lived JWT (sso_token) and each app
+has its own session exchange:
+
+- Akademik (app 76, akademik.unnes.ac.id): GET+POST /auth/sso_login with the
+  token (plain HTTP, op=sso; auto-run on session expiry). Data pages (KRS,
+  Hasil Studi) are Livewire -> render=true uses the persistent browser session.
+- Elena (app 30, elena.unnes.ac.id): the gateway iframe exchange primes the
+  portal session; the semester button (#btnKlik_<sem>) in the login_sso iframe
+  plus #btnTest on /portal/apis/login_url/<sem> establish the Moodle session
+  (automatic in render/crawl with sso_app = "30").
+- Page config: render=true (browser) vs plain HTTP; sso_app = gateway app id;
+  sso_semester for Elena; pre_url for semester switches; link_selector turns a
+  page into a crawl (follow links, extract rows per linked page, with
+  _source/_title columns). Example config lives at ~/.config/unnes/config.toml.
+
 ## Page discovery (runbook)
 
-The post-SSO app layout is not hardcoded: after unnes login, open the printed
-landing URL in a browser and inspect which page holds grades/schedule/announcements.
-Then register each page (see Quick start) - the CLI never guesses URLs. Full
-discovery docs land in M5.
+After unnes login: unnes status shows the SSO landing (gateway app list).
+Fetch the akademik pages (krs, hasil-studi) and the Elena crawl (elena-kursus)
+to learn the live URLs; add per-course assignment crawls (mod/assign links)
+with link_selector once you see the activity rows. The CLI never hardcodes
+URLs - every target is a config page.
 
 ## Notes
 
