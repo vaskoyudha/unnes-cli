@@ -76,15 +76,17 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
     return fail("usage", "could not launch Chromium: " + message + " (run: npx playwright install chromium)");
   }
 
+  interface PageLike {
+    url(): Promise<string>;
+    goto(u: string, o?: unknown): Promise<unknown>;
+    on(ev: string, cb: () => void): void;
+    isClosed(): boolean;
+  }
   const ctx = browser as {
     newContext(): Promise<{
-      newPage(): Promise<{
-        url(): Promise<string>;
-        goto(u: string, o?: unknown): Promise<unknown>;
-        on(ev: string, cb: () => void): void;
-        isClosed(): boolean;
-      }>;
+      newPage(): Promise<PageLike>;
       cookies(): Promise<PlaywrightCookie[]>;
+      on(ev: string, cb: (p: PageLike) => void): void;
     }>;
     on(ev: string, cb: () => void): void;
     close(): Promise<void>;
@@ -93,20 +95,31 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
   try {
     const context = await ctx.newContext();
     const page = await context.newPage();
-    // Window close is NOT observable via page.url() (it keeps returning the
-    // last URL); use Playwright's close/disconnected events and isClosed().
-    let pageClosed = false;
-    page.on("close", () => { pageClosed = true; });
+
+    // Track EVERY tab/popup: Google Sign-In 2.0 (g-signin2) opens the account
+    // chooser in a POPUP, and the handoff may land in any tab. We watch them
+    // all. A popup closing after consent is NORMAL - only abort when every
+    // tab is gone (window closed) or the browser process exits.
+    const pages: PageLike[] = [page];
     let browserGone = false;
+    context.on("page", (p) => {
+      pages.push(p);
+      p.on("close", () => {
+        const i = pages.indexOf(p);
+        if (i >= 0) pages.splice(i, 1);
+      });
+    });
     ctx.on("disconnected", () => { browserGone = true; });
+
     await page.goto(hubUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
 
     // Instructions go to stderr: stdout is reserved for the single JSON result.
     console.error("");
     console.error("Opening " + hubUrl + " in your browser...");
-    console.error("Sign in with your UNNES Google account. It auto-captures once");
-    console.error("the SSO lands you on a UNNES app page, or press Enter here");
-    console.error("after you have signed in. Close the window to abort.");
+    console.error("Sign in with your UNNES Google account (click 'Login dengan");
+    console.error("UNNES-ID'). Google opens a separate sign-in window - complete");
+    console.error("it there. Capture happens automatically after the SSO redirect,");
+    console.error("or press Enter here. Close the window to abort.");
     console.error("");
 
     const deadline = Date.now() + MAX_WAIT_MS;
@@ -119,21 +132,31 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
       process.stdin.once("data", () => resolve("enter"));
     });
 
-    // Auto-detect: the browser left the hub host for another *.unnes.ac.id
-    // subdomain (the SSO handoff). Guest cookies alone (laravel_session,
-    // XSRF-TOKEN, G_ENABLED_IDPS) are deliberately NOT a trigger - they
-    // exist before login, and a name-based check cannot tell guest from
-    // authenticated sessions.
+    // Auto-detect, across all tabs. Verified against the live hub (2026-08):
+    // the 'Login dengan UNNES-ID' button calls gAuth2.signIn() (Google popup ->
+    // accounts.google.com, which closes after consent), then onSignIn() POSTs
+    // to /google/auth and the main tab navigates to the server-issued route
+    // (window.location.href = obj.route). That route navigation is the handoff:
+    //  - the login page never navigates on its own, so ANY path/query change
+    //    on the hub host means the route redirect happened, and
+    //  - a tab on another *.unnes.ac.id subdomain is the route landing too.
+    // The popup closing after consent is NORMAL and must NOT abort - only
+    // abort when every tab is gone or the browser process exits.
     while (Date.now() < deadline && done === null) {
       const poll = (async (): Promise<string | null> => {
         if (Date.now() - started < GRACE_MS) return null;
-        if (pageClosed || browserGone || page.isClosed()) return "closed";
-        let url = "";
-        try { url = await page.url(); } catch { return "closed"; } // defensive
-        let u: URL | null = null;
-        try { u = new URL(url); } catch { return null; }
-        if (u.hostname.endsWith("unnes.ac.id") && u.hostname !== "apps.unnes.ac.id") {
-          return "handoff";
+        if (browserGone || pages.length === 0) return "closed";
+        for (const p of [...pages]) {
+          if (p.isClosed()) continue;
+          let url = "";
+          try { url = await p.url(); } catch { continue; } // closed mid-loop
+          let u: URL | null = null;
+          try { u = new URL(url); } catch { continue; }
+          if (u.hostname.endsWith("unnes.ac.id")) {
+            const leftHub = u.hostname !== "apps.unnes.ac.id";
+            const changed = u.pathname !== "/" || u.search !== "";
+            if (leftHub || changed) return "handoff";
+          }
         }
         return null;
       })();
@@ -155,7 +178,16 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
     await new Promise((r) => setTimeout(r, 1500));
 
     let landingUrl: string | null = null;
-    try { landingUrl = await page.url(); } catch { /* page closed */ }
+    for (const p of [...pages]) {
+      if (p.isClosed()) continue;
+      try {
+        const u = new URL(await p.url());
+        if (u.hostname.endsWith("unnes.ac.id")) { landingUrl = u.href; break; }
+      } catch { /* ignore */ }
+    }
+    if (landingUrl === null) {
+      try { landingUrl = await page.url(); } catch { /* page closed */ }
+    }
 
     const all = await context.cookies();
     const jar = CookieJar.empty();
@@ -182,19 +214,11 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
       return fail("usage", "captured no unnes.ac.id cookies; did the Google sign-in complete?");
     }
 
-    // When auto-triggered, require some evidence of a real session: a cookie
-    // beyond the guest trio, or a landing page outside the hub.
-    if (done === "handoff") {
-      const hasNonGuest = [...names].some((n) => !GUEST_COOKIES.has(n));
-      let host = "";
-      try { host = new URL(landingUrl ?? "").hostname; } catch { /* ignore */ }
-      const leftHub = host !== "" && host !== "apps.unnes.ac.id";
-      if (!hasNonGuest && !leftHub) {
-        await ctx.close();
-        return fail("usage", "auto-capture fired but only guest cookies present (" + [...names].join(", ") + "). Sign in on the Google page, then press Enter here.");
-      }
-    }
-
+    // Auto-triggers only fire on real handoff shapes (hub redirect after a
+    // Google visit, or a tab on another unnes.ac.id subdomain), so no extra
+    // session-cookie proof is required - the jar may legitimately contain
+    // only the Laravel session cookie (the hub disconnects Google itself via
+    // auth2.disconnect(), which is why login always asks again).
     console.error("captured " + captured + " unnes.ac.id cookies: " + [...names].sort().join(", "));
     await ctx.close();
     return { contract: 1, ok: true, mode: "browser", landingUrl, capturedCookies: captured };
