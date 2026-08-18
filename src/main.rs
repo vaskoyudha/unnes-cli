@@ -643,50 +643,13 @@ fn cmd_kurikulum(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> 
 fn cmd_jadwal(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
     let nim = kurikulum::resolve_nim(home)
         .ok_or_else(|| app_err(1, "cannot determine NIM - set [general] nim in config or run unnes watch run first (biodata)"))?;
-    let url = format!("https://duanol.unnes.ac.id/v2/prakuliah/krs/form_isi_krs/{nim}.aspx");
-
-    // Same fetch strategy as kurikulum: plain HTTP, browser prime on miss.
-    let fetch = |u: &str| -> Result<Option<Vec<serde_json::Value>>> {
-        let mut job = fetcher::job("get", profile);
-        job["url"] = json!(u);
-        job["extract"] = json!({
-            "selector": "table tbody tr",
-            "fields": { "kode": "td:nth-child(3)", "nama": "td:nth-child(4)", "sks": "td:nth-child(5)", "jadwal": "td:nth-child(7)" },
-        });
-        let res = fetcher::run_job(home, profile, job)?;
-        if !res.ok || res.session_expired {
-            return Ok(None);
-        }
-        Ok(Some(res.records))
-    };
-    let mut records = fetch(&url)?;
-    if records.is_none() {
-        // refresh the gateway session (auto re-login with the saved profile),
-        // then prime the duanol session through the browser (app 23).
-        let _ = watch::ensure_session(home, profile);
-        let cfg = Config::load(home)?;
-        let page = cfg.pages.iter().find(|p| p.id == "sikadu-krs").cloned().unwrap_or_default();
-        let _ = watch::fetch_page(home, profile, &page);
-        records = fetch(&url)?;
-        if records.is_none() {
-            return Err(app_err(4, "jadwal: duanol session unavailable; run: unnes login"));
-        }
-    }
-
-    let mut sesi: Vec<jadwal::Sesi> = Vec::new();
-    for r in records.unwrap_or_default() {
-        let nama = r.get("nama").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        let kode = r.get("kode").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        let cell = r.get("jadwal").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if nama.is_empty() || cell.is_empty() {
-            continue;
-        }
-        sesi.extend(jadwal::parse_jadwal_cell(&cell, &nama, &kode));
-    }
+    let (sesi, info) = jadwal::fetch_and_parse(home, profile, &nim).map_err(|e| match format!("{e:#}") {
+        m if m.contains("session unavailable") || m.contains("session expired") => app_err(4, format!("jadwal: {m}")),
+        m => app_err(1, format!("jadwal: {m}")),
+    })?;
     if sesi.is_empty() {
         return Err(app_err(1, "jadwal: no sessions parsed - the KRS form may be empty or changed"));
     }
-    sesi.sort_by(|a, b| (jadwal::hari_urutan(&a.hari), &a.mulai, &a.mata_kuliah).cmp(&(jadwal::hari_urutan(&b.hari), &b.mulai, &b.mata_kuliah)));
 
     if json_out {
         println!("{}", serde_json::to_string_pretty(&sesi)?);
@@ -706,7 +669,7 @@ fn cmd_jadwal(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
         );
     }
     println!();
-    println!("{} sessions / {} mata kuliah", sesi.len(), sesi.iter().map(|s| &s.mata_kuliah).collect::<std::collections::HashSet<_>>().len());
+    println!("{} sessions / {} mata kuliah | semester {} | IPK {} | {} SKS", sesi.len(), sesi.iter().map(|s| &s.mata_kuliah).collect::<std::collections::HashSet<_>>().len(), info.semester, info.ipk, info.sks_plan);
     Ok(())
 }
 
