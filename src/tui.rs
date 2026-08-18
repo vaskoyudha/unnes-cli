@@ -93,24 +93,40 @@ fn next_class_today(sesi: &[Sesi]) -> Option<&Sesi> {
         .map(|(_, s)| s)
 }
 
+/// Env-gated debug log: UNNES_TUI_DEBUG=1 writes the load timeline to
+/// $UNNES_HOME/tui-debug.log so failures can be diagnosed on the user machine.
+fn dbg(home: &UnnesHome, msg: &str) {
+    if std::env::var("UNNES_TUI_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        let line = format!("{} {}
+", chrono::Local::now().format("%H:%M:%S"), msg);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(home.root.join("tui-debug.log")) {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
 impl TuiState {
     pub fn load(home: &UnnesHome, profile: &str) -> Self {
+        dbg(home, "load: mulai");
         let (session_valid, session_note) = probe_session(home, profile);
+        dbg(home, &format!("load: session valid={} note={}", session_valid, session_note));
         let nim = kurikulum::resolve_nim(home).unwrap_or_default();
         let identitas = biodata_rows(home);
 
         let (kursus, kurikulum_note) = match kurikulum::fetch_and_parse(home, profile, &nim) {
-            Ok(k) => (k, String::new()),
-            Err(e) => (Vec::new(), format!("{e:#}")),
+            Ok(k) => { dbg(home, &format!("load: kurikulum ok {} mk", k.len())); (k, String::new()) }
+            Err(e) => { dbg(home, &format!("load: kurikulum FAIL: {e:#}")); (Vec::new(), format!("{e:#}")) }
         };
         let (sesi, jadwal_info, jadwal_note) = match jadwal::fetch_and_parse(home, profile, &nim) {
-            Ok((s, i)) => (s, i, String::new()),
-            Err(e) => (Vec::new(), JadwalInfo::default(), format!("{e:#}")),
+            Ok((s, i)) => { dbg(home, &format!("load: jadwal ok {} sesi", s.len())); (s, i, String::new()) }
+            Err(e) => { dbg(home, &format!("load: jadwal FAIL: {e:#}")); (Vec::new(), JadwalInfo::default(), format!("{e:#}")) }
         };
         let (items, tugas_note) = match tugas::fetch_items(home, profile) {
-            Ok(it) => (it, String::new()),
-            Err(e) => (Vec::new(), format!("{e:#}")),
+            Ok(it) => { dbg(home, &format!("load: tugas ok {} item", it.len())); (it, String::new()) }
+            Err(e) => { dbg(home, &format!("load: tugas FAIL: {e:#}")); (Vec::new(), format!("{e:#}")) }
         };
+        dbg(home, "load: selesai");
         let log = changelog::read(home, None, None).unwrap_or_default();
         let mut pages = Vec::new();
         if let Ok(cfg) = Config::load(home) {
@@ -248,7 +264,7 @@ fn draw_dashboard(state: &TuiState, frame: &mut Frame, area: Rect) {
 
 fn draw_kurikulum(state: &TuiState, frame: &mut Frame, area: Rect) {
     if state.kursus.is_empty() {
-        frame.render_widget(Paragraph::new(if state.kurikulum_note.is_empty() { "belum ada data" } else { state.kurikulum_note.as_str() }).block(block("Kurikulum")), area);
+        frame.render_widget(Paragraph::new(if state.kurikulum_note.is_empty() { "belum ada data - tekan r untuk memuat" } else { state.kurikulum_note.as_str() }).block(block("Kurikulum - GAGAL AMBIL")), area);
         return;
     }
     let rows: Vec<Row> = state.kursus.iter().map(|k| {
@@ -272,7 +288,7 @@ fn draw_kurikulum(state: &TuiState, frame: &mut Frame, area: Rect) {
 
 fn draw_jadwal(state: &TuiState, frame: &mut Frame, area: Rect) {
     if state.sesi.is_empty() {
-        frame.render_widget(Paragraph::new(if state.jadwal_note.is_empty() { "belum ada jadwal" } else { state.jadwal_note.as_str() }).block(block("Jadwal")), area);
+        frame.render_widget(Paragraph::new(if state.jadwal_note.is_empty() { "belum ada jadwal - tekan r untuk memuat" } else { state.jadwal_note.as_str() }).block(block("Jadwal - GAGAL AMBIL")), area);
         return;
     }
     let today = hari_sekarang();
