@@ -98,11 +98,11 @@ impl TuiState {
         let nim = kurikulum::resolve_nim(home).unwrap_or_default();
         let identitas = biodata_rows(home);
 
-        let (kursus, kurikulum_note) = match kurikulum::fetch_plain(home, profile, &nim) {
+        let (kursus, kurikulum_note) = match kurikulum::fetch_and_parse(home, profile, &nim) {
             Ok(k) => (k, String::new()),
             Err(e) => (Vec::new(), format!("{e:#}")),
         };
-        let (sesi, jadwal_info, jadwal_note) = match jadwal::fetch_plain(home, profile, &nim) {
+        let (sesi, jadwal_info, jadwal_note) = match jadwal::fetch_and_parse(home, profile, &nim) {
             Ok((s, i)) => (s, i, String::new()),
             Err(e) => (Vec::new(), JadwalInfo::default(), format!("{e:#}")),
         };
