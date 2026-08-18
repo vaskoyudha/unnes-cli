@@ -44,6 +44,14 @@ impl UnnesHome {
     pub fn profiles_dir(&self) -> PathBuf {
         self.root.join("profiles")
     }
+    /// Cookie jar for one profile (written by the fetcher, 0600).
+    pub fn profile_jar_file(&self, profile: &str) -> PathBuf {
+        self.profiles_dir().join(format!("{profile}.json"))
+    }
+    /// Login metadata for one profile (landing URL, timestamp).
+    pub fn profile_meta_file(&self, profile: &str) -> PathBuf {
+        self.profiles_dir().join(format!("{profile}.meta.json"))
+    }
     pub fn snapshots_dir(&self) -> PathBuf {
         self.root.join("snapshots")
     }

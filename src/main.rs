@@ -9,15 +9,20 @@
 mod changelog;
 mod config;
 mod diff;
+mod fetcher;
 mod output;
 mod paths;
 
+use std::fs;
 use std::process::ExitCode;
+use std::time::SystemTime;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use serde_json::json;
 
 use crate::config::Config;
+use crate::fetcher::{JobError, JobResult};
 use crate::paths::UnnesHome;
 
 /// CLI entry.
@@ -42,20 +47,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Save an authenticated session (interactive prompt). [M3]
+    /// Save an authenticated session (Google SSO via a browser window)
     Login(LoginArgs),
-    /// Forget the saved session. [M3]
+    /// Forget the saved session.
     Logout,
-    /// Session state, last sync, next poll. [M3]
+    /// Session state, last sync, next poll.
     Status,
-    /// Fetch one configured page and print records. [M3]
+    /// Fetch one configured page and print records.
     Fetch(FetchArgs),
-    /// Fetch the grades page (alias for fetch grades). [M3]
-    Grades(FetchArgs),
-    /// Fetch the schedule page (alias for fetch schedule). [M3]
+    /// Fetch the grades page (alias for fetch grades).
+    Grades(PageAliasArgs),
+    /// Fetch the schedule page (alias for fetch schedule).
     Schedule(ScheduleArgs),
-    /// Fetch the announcements page (alias for fetch announcements). [M3]
-    Announcements(FetchArgs),
+    /// Fetch the announcements page (alias for fetch announcements).
+    Announcements(PageAliasArgs),
     /// Watch commands: add/rm/list/run/daemon. [M4]
     Watch(WatchArgs),
     /// Print the change log.
@@ -64,7 +69,7 @@ enum Cmd {
 
 #[derive(Args)]
 struct LoginArgs {
-    /// Account email (prompted when omitted)
+    /// Account email (kept for future form-login mode; SSO ignores it)
     #[arg(long)]
     email: Option<String>,
 }
@@ -73,6 +78,13 @@ struct LoginArgs {
 struct FetchArgs {
     /// Page id from config.toml
     page_id: String,
+    /// Emit CSV instead of a table (overrides --json)
+    #[arg(long)]
+    csv: bool,
+}
+
+#[derive(Args)]
+struct PageAliasArgs {
     /// Emit CSV instead of a table (overrides --json)
     #[arg(long)]
     csv: bool,
@@ -172,17 +184,18 @@ fn main() -> ExitCode {
         }
     }
 }
-
 fn run(cli: Cli) -> Result<()> {
     let home = UnnesHome::discover();
+    home.ensure_dirs()?;
+    let profile = fetcher::profile_name();
     match cli.cmd {
-        Cmd::Login(_) => Err(not_yet("login", "M3")),
-        Cmd::Logout => Err(not_yet("logout", "M3")),
-        Cmd::Status => Err(not_yet("status", "M3")),
-        Cmd::Fetch(a) => Err(not_yet(&format!("fetch {}", a.page_id), "M3")),
-        Cmd::Grades(_) => Err(not_yet("grades", "M3")),
-        Cmd::Schedule(_) => Err(not_yet("schedule", "M3")),
-        Cmd::Announcements(_) => Err(not_yet("announcements", "M3")),
+        Cmd::Login(_) => cmd_login(&home, &profile),
+        Cmd::Logout => cmd_logout(&home, &profile),
+        Cmd::Status => cmd_status(&home, &profile, cli.json),
+        Cmd::Fetch(a) => cmd_fetch(&home, &profile, &a.page_id, a.csv, cli.json),
+        Cmd::Grades(a) => cmd_fetch(&home, &profile, "grades", a.csv, cli.json),
+        Cmd::Schedule(a) => cmd_fetch(&home, &profile, "schedule", a.csv, cli.json),
+        Cmd::Announcements(a) => cmd_fetch(&home, &profile, "announcements", a.csv, cli.json),
         Cmd::Watch(w) => match w.cmd {
             WatchCmd::List => watch_list(&home, cli.json),
             WatchCmd::Add { .. } => Err(not_yet("watch add", "M4")),
@@ -192,6 +205,145 @@ fn run(cli: Cli) -> Result<()> {
         },
         Cmd::Changelog(a) => changelog_list(&home, &a, cli.json),
     }
+}
+
+/// Map a fetcher error code to the CLI exit code spec.
+fn err_code_for(code: &str) -> u8 {
+    match code {
+        "usage" | "contract" => 2,
+        "network" | "timeout" | "challenge" => 5,
+        _ => 1,
+    }
+}
+
+fn err_msg(res: &JobResult) -> String {
+    match &res.error {
+        Some(JobError { code, message }) => format!("{message} ({code})"),
+        None => "unknown fetcher error".to_string(),
+    }
+}
+
+/// unnes login: Google SSO via a headed browser window.
+fn cmd_login(home: &UnnesHome, profile: &str) -> Result<()> {
+    let cfg = Config::load(home)?;
+    let mut job = fetcher::job("login", profile);
+    job["mode"] = json!("browser");
+    job["baseUrl"] = json!(cfg.general.base_url);
+    let res = fetcher::run_job(home, profile, job)?;
+    if !res.ok {
+        let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
+        return Err(app_err(err_code_for(&code), format!("login failed: {}", err_msg(&res))));
+    }
+    // Persist login metadata for unnes status.
+    let meta = json!({
+        "profile": profile,
+        "landing_url": res.landing_url,
+        "logged_in_at": chrono::Utc::now().to_rfc3339(),
+    });
+    fs::write(home.profile_meta_file(profile), serde_json::to_string_pretty(&meta)?)?;
+    println!("logged in (profile {profile}), {} cookies captured", res.captured_cookies.unwrap_or(0));
+    if let Some(landing) = &res.landing_url {
+        println!("SSO landing page: {landing}");
+        println!("point a watch at it: unnes watch add <id> --url={landing} --selector=<css>");
+    }
+    Ok(())
+}
+
+/// unnes logout: drop the saved session.
+fn cmd_logout(home: &UnnesHome, profile: &str) -> Result<()> {
+    let job = fetcher::job("logout", profile);
+    let res = fetcher::run_job(home, profile, job)?;
+    if !res.ok {
+        let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
+        return Err(app_err(err_code_for(&code), format!("logout failed: {}", err_msg(&res))));
+    }
+    let _ = fs::remove_file(home.profile_meta_file(profile));
+    println!("session cleared (profile {profile})");
+    Ok(())
+}
+
+/// unnes status: session state from the saved jar + login metadata.
+fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
+    let jar = home.profile_jar_file(profile);
+    if !jar.is_file() {
+        if json_out {
+            println!("{}", serde_json::to_string_pretty(&json!({ "profile": profile, "logged_in": false }))?);
+        }
+        return Err(app_err(3, format!("not logged in (profile {profile}); run: unnes login")));
+    }
+    let modified = jar.metadata()?.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let age_secs = SystemTime::now().duration_since(modified).unwrap_or_default().as_secs();
+    let meta_path = home.profile_meta_file(profile);
+    let landing: Option<String> = if meta_path.is_file() {
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&meta_path)?)
+            .ok()
+            .and_then(|v| v.get("landing_url").and_then(|l| l.as_str().map(String::from)))
+    } else {
+        None
+    };
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&json!({
+            "profile": profile,
+            "logged_in": true,
+            "jar_age_seconds": age_secs,
+            "landing_url": landing,
+        }))?);
+    } else {
+        println!("profile: {profile}");
+        println!("session: saved (jar updated {age_secs}s ago)");
+        match landing {
+            Some(l) => println!("SSO landing: {l}"),
+            None => println!("SSO landing: unknown (re-run unnes login)"),
+        }
+    }
+    Ok(())
+}
+
+/// unnes fetch / grades / schedule / announcements.
+fn cmd_fetch(home: &UnnesHome, profile: &str, page_id: &str, csv: bool, json_out: bool) -> Result<()> {
+    let cfg = Config::load(home)?;
+    let page = cfg.page(page_id).ok_or_else(|| {
+        app_err(1, format!("page '{page_id}' is not configured ({}); add it with: unnes watch add {page_id} --url=<page-url> --selector=<css>", home.config_file().display()))
+    })?;
+    if !home.profile_jar_file(profile).is_file() {
+        return Err(app_err(3, format!("not logged in (profile {profile}); run: unnes login")));
+    }
+
+    let mut job = fetcher::job("get", profile);
+    job["url"] = json!(page.url);
+    if let Some(sel) = &page.selector {
+        job["extract"] = json!({ "selector": sel });
+    }
+    if !page.normalize.is_empty() {
+        job["extraRegexes"] = json!(page.normalize);
+    }
+    let res = fetcher::run_job(home, profile, job)?;
+    if !res.ok {
+        let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
+        return Err(app_err(err_code_for(&code), format!("fetch {page_id}: {}", err_msg(&res))));
+    }
+    if res.session_expired {
+        return Err(app_err(4, format!("session expired while fetching '{page_id}'; run: unnes login")));
+    }
+    if res.challenge {
+        return Err(app_err(5, format!("fetch {page_id}: Cloudflare challenge; back off and retry later")));
+    }
+
+    let records = &res.records;
+    if csv {
+        println!("{}", output::records_csv(records));
+    } else if json_out {
+        println!("{}", output::records_json(records));
+    } else {
+        println!("{}", output::records_table(records));
+    }
+
+    if let Some(sel) = &page.selector {
+        if records.is_empty() {
+            return Err(app_err(6, format!("fetch {page_id}: no records matched selector '{sel}' - the page may have changed")));
+        }
+    }
+    Ok(())
 }
 
 fn watch_list(home: &UnnesHome, json: bool) -> Result<()> {

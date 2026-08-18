@@ -13,6 +13,8 @@ export interface Job {
   /** used by login/logout when the job URL family is not explicit */
   baseUrl?: string;
   url?: string;
+  /** login: "form" (legacy email/password, default) or "browser" (Google SSO via Playwright) */
+  mode?: "form" | "browser";
   form?: LoginForm;
   extract?: ExtractSpec;
   extraRegexes?: string[];
@@ -57,6 +59,10 @@ export async function processJob(job: Job): Promise<JobResult> {
       };
     }
     case "login": {
+      if (job.mode === "browser") {
+        const { browserLogin } = await import("./browser.js");
+        return browserLogin(profilePath, baseUrl);
+      }
       if (!job.form) return fail("usage", "op=login requires form{email,password}");
       return opLogin(f, baseUrl, profilePath, jar, job.form);
     }

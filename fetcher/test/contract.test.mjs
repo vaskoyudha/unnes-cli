@@ -251,6 +251,25 @@ test("cookie jar roundtrip keeps only matching, unexpired cookies", async () => 
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("browser login respects UNNES_NO_BROWSER (no browser launched)", async () => {
+  await withHome("nobrowser", async () => {
+    process.env.UNNES_NO_BROWSER = "1";
+    try {
+      const res = await processJob({
+        contract: 1,
+        op: "login",
+        mode: "browser",
+        baseUrl: "https://apps.unnes.ac.id",
+      });
+      assert.equal(res.ok, false);
+      assert.equal(res.error.code, "usage");
+      assert.match(res.error.message, /UNNES_NO_BROWSER/);
+    } finally {
+      delete process.env.UNNES_NO_BROWSER;
+    }
+  });
+});
+
 test("contract versions other than 1 are rejected", async () => {
   await withHome("contract", async (home) => {
     const res = await processJob({

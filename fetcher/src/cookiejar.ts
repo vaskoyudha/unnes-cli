@@ -80,6 +80,13 @@ export class CookieJar {
     await rename(tmp, path);
   }
 
+  /** Add a fully-formed cookie (e.g. captured from a browser session). */
+  addCookie(c: StoredCookie): void {
+    if (c.expires !== null && c.expires <= Date.now()) return;
+    this.cookies = this.cookies.filter((x) => !(x.name === c.name && x.domain === c.domain && x.path === c.path));
+    this.cookies.push(c);
+  }
+
   /** Apply Set-Cookie headers from a response to the request URL. */
   addFromSetCookie(setCookie: string[], requestUrl: URL): void {
     for (const line of setCookie) {
