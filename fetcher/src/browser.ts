@@ -1,14 +1,23 @@
 // Browser-assisted login for Google SSO (apps.unnes.ac.id).
 //
 // Plain HTTP cannot complete Google OAuth (interactive consent/2FA), so
-// login runs a real (headed) Chromium window once, lets the user sign in,
+// login runs a real (headed) Chromium window, lets the user sign in,
 // captures every *.unnes.ac.id cookie into the profile jar, and closes.
 // Everything after that (fetch/watch) stays plain HTTP and headless.
+//
+// The Chromium profile is PERSISTENT (launchPersistentContext into
+// <home>/browser-profiles/<profile>): Google's sign-in state (account
+// choice, 2FA trust) survives between logins, so re-logins after session
+// expiry are one click. The portal itself calls auth2.disconnect() after
+// every login, so a full re-auth always happens - the profile just makes
+// it painless. Security note: this profile stores Google session data on
+// disk (0700); it lives under UNNES_HOME and is never pushed to git.
 //
 // Playwright is imported dynamically so the module loads without it; the
 // browser binary itself is installed separately (npx playwright install
 // chromium) and never needed for non-login operations.
 
+import { chmodSync, mkdirSync } from "node:fs";
 import { CookieJar } from "./cookiejar.js";
 
 export interface BrowserLoginResult {
@@ -42,7 +51,7 @@ interface PlaywrightCookie {
   sameSite: "Strict" | "Lax" | "None";
 }
 
-export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): Promise<BrowserLoginResult> {
+export async function browserLogin(jarPath: string, browserDir: string, hubUrl: string = HUB_URL): Promise<BrowserLoginResult> {
   const fail = (code: string, message: string): BrowserLoginResult => ({
     contract: 1, ok: false, mode: "browser", landingUrl: null, capturedCookies: 0,
     error: { code, message },
@@ -54,11 +63,15 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
   }
 
   // playwright is a CJS package; normalize the interop shape defensively.
-  let chromium: { launch: (opts: Record<string, unknown>) => Promise<unknown> } | null = null;
+  type ChromiumLike = {
+    launch: (opts: Record<string, unknown>) => Promise<unknown>;
+    launchPersistentContext: (dir: string, opts: Record<string, unknown>) => Promise<unknown>;
+  };
+  let chromium: ChromiumLike | null = null;
   try {
     const mod = (await import("playwright")) as unknown as {
-      chromium?: { launch: (opts: Record<string, unknown>) => Promise<unknown> };
-      default?: { chromium?: { launch: (opts: Record<string, unknown>) => Promise<unknown> } };
+      chromium?: ChromiumLike;
+      default?: { chromium?: ChromiumLike };
     };
     chromium = mod.chromium ?? mod.default?.chromium ?? null;
   } catch {
@@ -68,50 +81,58 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
     return fail("usage", "playwright is not installed; run: cd fetcher && npm ci && npx playwright install chromium");
   }
 
-  let browser: unknown;
-  try {
-    browser = await chromium.launch({ headless: false });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return fail("usage", "could not launch Chromium: " + message + " (run: npx playwright install chromium)");
-  }
-
   interface PageLike {
     url(): Promise<string>;
     goto(u: string, o?: unknown): Promise<unknown>;
     on(ev: string, cb: () => void): void;
     isClosed(): boolean;
   }
-  const ctx = browser as {
-    newContext(): Promise<{
-      newPage(): Promise<PageLike>;
-      cookies(): Promise<PlaywrightCookie[]>;
-      on(ev: string, cb: (p: PageLike) => void): void;
-    }>;
-    on(ev: string, cb: () => void): void;
+  // Ensure the persistent profile dir exists with owner-only permissions.
+  try {
+    mkdirSync(browserDir, { recursive: true });
+    chmodSync(browserDir, 0o700);
+  } catch { /* best effort */ }
+
+  let launched: unknown = null;
+  try {
+    launched = await chromium.launchPersistentContext(browserDir, { headless: false });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return fail("usage", "could not launch Chromium with persistent profile: " + message + " (is another unnes login running? delete " + browserDir + " to force a fresh profile)");
+  }
+  const ctx = launched as {
+    pages(): PageLike[];
+    newPage(): Promise<PageLike>;
+    cookies(): Promise<PlaywrightCookie[]>;
+    on(ev: "page", cb: (p: PageLike) => void): void;
+    on(ev: "close", cb: () => void): void;
     close(): Promise<void>;
   };
 
   try {
-    const context = await ctx.newContext();
-    const page = await context.newPage();
+    // Reuse an existing page if the persistent profile restored one.
+    const initial = ctx.pages();
+    const page = initial.length > 0 ? initial[0] : await ctx.newPage();
 
-    // Track EVERY tab/popup: Google Sign-In 2.0 (g-signin2) opens the account
-    // chooser in a POPUP, and the handoff may land in any tab. We watch them
-    // all. A popup closing after consent is NORMAL - only abort when every
-    // tab is gone (window closed) or the browser process exits.
-    const pages: PageLike[] = [page];
+    // Track EVERY tab/popup: the hub's 'Login dengan UNNES-ID' button calls
+    // gAuth2.signIn() which opens the Google account chooser in a POPUP, and
+    // the handoff may land in any tab. We watch them all. A popup closing
+    // after consent is NORMAL - only abort when every tab is gone (window
+    // closed) or the browser process exits.
+    const pages: PageLike[] = [...initial];
     let browserGone = false;
-    context.on("page", (p) => {
+    ctx.on("page", (p) => {
       pages.push(p);
       p.on("close", () => {
         const i = pages.indexOf(p);
         if (i >= 0) pages.splice(i, 1);
       });
     });
-    ctx.on("disconnected", () => { browserGone = true; });
+    ctx.on("close", () => { browserGone = true; });
 
-    await page.goto(hubUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    if (!page.isClosed()) {
+      await page.goto(hubUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    }
 
     // Instructions go to stderr: stdout is reserved for the single JSON result.
     console.error("");
@@ -189,7 +210,7 @@ export async function browserLogin(jarPath: string, hubUrl: string = HUB_URL): P
       try { landingUrl = await page.url(); } catch { /* page closed */ }
     }
 
-    const all = await context.cookies();
+    const all = await ctx.cookies();
     const jar = CookieJar.empty();
     let captured = 0;
     const names = new Set<string>();

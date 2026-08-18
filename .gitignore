@@ -15,6 +15,7 @@ credentials.env
 # Local state when UNNES_HOME points into the repo (dev/testing)
 /storage/
 /profiles/
+/browser-profiles/
 changelog.jsonl
 
 # Editor/OS noise

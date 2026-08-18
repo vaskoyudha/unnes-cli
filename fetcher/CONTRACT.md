@@ -5,7 +5,8 @@ ONE JSON result on stdout (single line). Anything else on stdout is a bug.
 
 ## Environment
 
-- UNNES_HOME - state root (cookie jars under profiles/); required by the CLI.
+- UNNES_HOME - state root (cookie jars under profiles/, persistent Chromium
+  profiles under browser-profiles/); required by the CLI.
 - UNNES_USER_AGENT - UA string for requests (optional, polite default).
 - UNNES_PROFILE - profile name; default 'default'.
 - UNNES_NO_BROWSER - set to 1 to make op=login mode=browser fail fast
@@ -45,9 +46,16 @@ network | timeout | csrf | login | usage | contract | internal.
   is the data portal and is deliberately ignored for browser login (it has no
   Google sign-in). The user signs in interactively; all *.unnes.ac.id cookies
   are captured into the jar and the SSO landing URL is reported. Auto-capture
-  fires only when the browser leaves the hub host (SSO handoff) or on an
-  explicit Enter. Requires npx playwright install chromium once. Never runs
-  headless in cron paths - only during interactive unnes login.
+  fires on the SSO route navigation (any path/query change on the hub host, or
+  a tab on another *.unnes.ac.id subdomain) or on an explicit Enter.
+- The Chromium profile is PERSISTENT in <home>/browser-profiles/<profile>
+  (0700): Google's sign-in state (account choice, 2FA trust) survives between
+  logins, so re-logins after session expiry are one click. The hub calls
+  auth2.disconnect() after every login, so a full Google re-auth always
+  happens - the profile just makes it painless. This profile stores Google
+  session data on disk; it is never uploaded or committed to git.
+  Requires npx playwright install chromium once. Never runs headless in cron
+  paths - only during interactive unnes login.
 - get: sessionExpired when a non-login URL lands on /auth/login or 401;
   the CLI then tells the user to re-run login (SSO cannot auto re-login).
 - challenge: heuristic for Cloudflare 403 challenge pages; CLI backs off.

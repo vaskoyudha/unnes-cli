@@ -36,6 +36,17 @@ A TUI is explicitly out of v1.
 - Node.js >= 20 (fetch arm: cd fetcher && npm ci && npm run build)
 - Chromium for the SSO login step (one time: cd fetcher && npx playwright install chromium)
 
+## Login & the browser profile
+
+unnes login opens apps.unnes.ac.id in a headed Chromium window backed by a
+PERSISTENT profile at $UNNES_HOME/browser-profiles/<profile> (0700). Your
+Google account choice and 2FA trust survive between logins, so re-logins after
+the portal's session expiry are one click instead of a full Google re-auth.
+The portal itself calls auth2.disconnect() after every login, so a Google
+sign-in always happens - the stored profile only makes it easy. Note: this
+profile stores Google session data on disk under UNNES_HOME; it is never
+uploaded or committed (gitignored).
+
 ## Quick start
 
 1. Build: cargo build --release
