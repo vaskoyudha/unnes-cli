@@ -14,7 +14,7 @@ export interface Job {
   baseUrl?: string;
   url?: string;
   /** login: "form" (legacy email/password, default) or "browser" (Google SSO via Playwright) */
-  mode?: "form" | "browser";
+  mode?: "form" | "browser" | "auto";
   form?: LoginForm;
   extract?: ExtractSpec;
   extraRegexes?: string[];
@@ -167,6 +167,12 @@ export async function processJob(job: Job): Promise<JobResult> {
         // which is the data portal and has no Google sign-in.
         const { browserLogin } = await import("./browser.js");
         return browserLogin(profilePath, browserDir);
+      }
+      if (job.mode === "auto") {
+        // Scripted headless re-login with the saved profile; falls back to
+        // needsInteraction when Google asks for password/2FA/CAPTCHA.
+        const { autoLogin } = await import("./browser.js");
+        return autoLogin(profilePath, browserDir);
       }
       if (!job.form) return fail("usage", "op=login requires form{email,password}");
       const jar = await CookieJar.load(profilePath);

@@ -75,6 +75,55 @@ pub fn fetch_page(home: &UnnesHome, profile: &str, page: &Page) -> Result<JobRes
     Ok(res)
 }
 
+/// Session refresh using the SAVED profile:
+/// 1. headless scripted attempt (zero interaction when Google cooperates),
+/// 2. fall back to the headed window automatically when Google demands
+///    interaction (password/2FA/CAPTCHA) - the user just clicks once.
+pub fn auto_login(home: &UnnesHome, profile: &str) -> Result<String> {
+    let mut job = fetcher::job("login", profile);
+    job["mode"] = json!("auto");
+    match fetcher::run_job(home, profile, job) {
+        Ok(res) if res.ok => Ok("re-login ok (headless)".to_string()),
+        Ok(res) => {
+            let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
+            let msg = res.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+            if code == "needsInteraction" {
+                // Google wants a real click: open the headed window automatically.
+                let mut hjob = fetcher::job("login", profile);
+                hjob["mode"] = json!("browser");
+                let res = fetcher::run_job(home, profile, hjob)?;
+                if res.ok {
+                    return Ok("re-login ok (you clicked once in the window)".to_string());
+                }
+                let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
+                let msg = res.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+                bail!("{msg} ({code})");
+            }
+            bail!("{msg} ({code})");
+        }
+        Err(e) => bail!("{e:#}"),
+    }
+}
+
+/// Best-effort: if the gateway session is expired and auto_relogin is enabled,
+/// run the scripted re-login once. Errors are swallowed here - the per-page
+/// outcomes still report session problems honestly.
+pub fn ensure_session(home: &UnnesHome, profile: &str) {
+    let Ok(cfg) = Config::load(home) else { return };
+    if !cfg.general.auto_relogin {
+        return;
+    }
+    let mut job = fetcher::job("get", profile);
+    job["url"] = json!("https://apps.unnes.ac.id/gate/list");
+    let expired = match fetcher::run_job(home, profile, job) {
+        Ok(res) => res.session_expired || !res.ok,
+        Err(_) => false,
+    };
+    if expired {
+        let _ = auto_login(home, profile);
+    }
+}
+
 /// One batch job entry for a render/crawl page.
 fn batch_entry(page: &Page) -> Value {
     let mut e = json!({ "url": page.url });
@@ -205,6 +254,7 @@ fn handle_result(
 /// primes deduplicated); plain pages are fetched over plain HTTP individually.
 pub fn run_pass(home: &UnnesHome, profile: &str, only: Option<&str>) -> Result<Vec<WatchOutcome>> {
     let cfg = Config::load(home)?;
+    ensure_session(home, profile);
     let pages: Vec<&Page> = cfg.pages.iter().filter(|p| only.map_or(true, |id| p.id == id)).collect();
     let mut out = Vec::new();
 

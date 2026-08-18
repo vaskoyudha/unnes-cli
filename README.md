@@ -44,6 +44,17 @@ A TUI is explicitly out of v1.
     make install            # -> ~/.cargo/bin/unnes
     make test               # full Rust + fetcher suites
 
+## Auto re-login (saved profile)
+
+The gateway session lapses roughly every 2h (server-side Laravel session).
+When any command (status/fetch/watch) detects an expired session and
+general.auto_relogin = true (default), the system refreshes it automatically
+using the SAVED profile: a headless scripted attempt first (zero interaction
+when Google cooperates), and if Google demands interaction - password, 2FA,
+CAPTCHA, or the consent screen the portal forces on every login - it opens
+the headed browser window automatically; click once and the command resumes.
+Disable with: auto_relogin = false in [general].
+
 ## Login & the browser profile
 
 unnes login opens apps.unnes.ac.id in a headed Chromium window backed by a

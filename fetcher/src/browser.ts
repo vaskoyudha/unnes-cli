@@ -739,3 +739,119 @@ export async function batchPages(
     try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
   }
 }
+
+
+// ---------------------------------------------------------------------------
+// op: login mode=auto - scripted HEADLESS re-login.
+// The persistent profile remembers the Google account; when the gateway
+// session lapses we can usually re-establish it without user interaction:
+// click the UNNES-ID button, then click through the Google consent/account
+// screens if they appear (remembered account, "Allow"/"Continue"). If Google
+// demands anything else (password, 2FA, CAPTCHA) we fail with
+// needsInteraction and the caller falls back to the headed browser login.
+// ---------------------------------------------------------------------------
+
+export async function autoLogin(jarPath: string, browserDir: string): Promise<BrowserLoginResult> {
+  const fail = (code: string, message: string): BrowserLoginResult => ({
+    contract: 1, ok: false, mode: "browser", landingUrl: null, capturedCookies: 0, error: { code, message },
+  });
+  if (process.env.UNNES_NO_BROWSER) {
+    return fail("usage", "auto login disabled via UNNES_NO_BROWSER");
+  }
+  let ctx: unknown;
+  try {
+    ctx = await launchContext(browserDir);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return fail("usage", message);
+  }
+  const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
+  const P = page as {
+    goto(u: string, o?: unknown): Promise<unknown>;
+    url(): Promise<string>;
+    content(): Promise<string>;
+    click(s: string, o?: unknown): Promise<void>;
+  };
+  try {
+    // 1. Is the gateway session already valid?
+    await P.goto("https://apps.unnes.ac.id/", { waitUntil: "domcontentloaded", timeout: 60000 });
+    await new Promise((r) => setTimeout(r, 4000));
+    const body0 = await P.content();
+    if (!LOGIN_MARKERS.test(body0.replace(/<script[\s\S]*?<\/script>/gi, " "))) {
+      // not the login page - session already alive; just sync cookies
+      const jar = await CookieJar.load(jarPath);
+      const captured = await syncJarFromContext(ctx, jar);
+      await jar.save(jarPath);
+      return { contract: 1, ok: true, mode: "browser", landingUrl: await P.url(), capturedCookies: captured };
+    }
+
+    // 2. Click the UNNES-ID (Google) button.
+    await P.click("#btn-google", { timeout: 8000 });
+
+    // 3. Handle any Google popup: account chooser + consent screen.
+    const ctxPages = (ctx as { pages(): unknown[] }).pages();
+    const popup = ctxPages.map((p) => p as { url(): string }).find((x) => x.url().includes("accounts.google.com"));
+    const PO = popup ?? (await waitForPopup(ctx, 12000));
+    if (PO) {
+      const pop = PO as {
+        url(): string;
+        click(s: string, o?: unknown): Promise<void>;
+        waitForTimeout(ms: number): Promise<void>;
+        keyboard?: { press(k: string): Promise<void> };
+      };
+      await pop.waitForTimeout(4000);
+      // account chooser: click the remembered account
+      try { await pop.click("[data-email]", { timeout: 6000 }); } catch { /* no chooser */ }
+      // consent screen: Allow / Continue
+      for (const sel of ["#submit_approve_access", "button:has-text('Allow')", "button:has-text('Continue')", "input#submit_approve_access", "button:has-text('Lanjutkan')", "button:has-text('Izinkan')"]) {
+        try { await pop.click(sel, { timeout: 3000 }); break; } catch { /* try next */ }
+      }
+      // wait for the popup to close (consent done) or the handoff to complete
+      for (let i = 0; i < 12; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const still = ctxPages.some((x) => (x as { url(): string }).url().includes("accounts.google.com"));
+        if (!still) break;
+      }
+    }
+
+    // 4. Handoff + validation: the main tab redirects to the app route.
+    for (let i = 0; i < 8; i++) {
+      await new Promise((r) => setTimeout(r, 3000));
+      try {
+        const u = await P.url();
+        if (/\/(auth\/)?login/i.test(u)) continue;
+        const body = await P.content();
+        if (!LOGIN_MARKERS.test(body.replace(/<script[\s\S]*?<\/script>/gi, " "))) break;
+      } catch { /* closed */ }
+    }
+
+    // 5. Verify the session is real: fetch the gateway applications list.
+    await P.goto("https://apps.unnes.ac.id/gate/list", { waitUntil: "domcontentloaded", timeout: 60000 });
+    await new Promise((r) => setTimeout(r, 3000));
+    const body = await P.content();
+    const text = body.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    if (LOGIN_MARKERS.test(text)) {
+      return fail("needsInteraction", "Google asked for interaction (password/2FA/CAPTCHA); run: unnes login");
+    }
+    const jar = await CookieJar.load(jarPath);
+    const captured = await syncJarFromContext(ctx, jar);
+    await jar.save(jarPath);
+    return { contract: 1, ok: true, mode: "browser", landingUrl: await P.url(), capturedCookies: captured };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return fail("needsInteraction", "auto re-login could not complete: " + message.slice(0, 200) + "; run: unnes login");
+  } finally {
+    try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
+  }
+}
+
+async function waitForPopup(ctx: unknown, timeoutMs: number): Promise<unknown | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pages = (ctx as { pages(): unknown[] }).pages();
+    const found = pages.find((p) => (p as { url(): string }).url().includes("accounts.google.com"));
+    if (found) return found;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return null;
+}

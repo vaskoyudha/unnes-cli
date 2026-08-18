@@ -20,6 +20,10 @@ pub struct Config {
 pub struct General {
     pub base_url: String,
     pub default_interval: u64,
+    /// On session expiry, retry with the scripted Google re-login
+    /// (saved profile) before failing; default true.
+    #[serde(default = "default_true")]
+    pub auto_relogin: bool,
     pub min_interval: u64,
     pub jitter_fraction: f64,
     pub user_agent: String,
@@ -79,11 +83,16 @@ pub struct Page {
     pub sso_semester: Option<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for General {
     fn default() -> Self {
         Self {
-            base_url: "https://student.unnes.ac.id".to_string(),
+            base_url: "https://apps.unnes.ac.id".to_string(),
             default_interval: 900,
+            auto_relogin: true,
             min_interval: 60,
             jitter_fraction: 0.1,
             user_agent: "unnes-cli/0.1 (personal student automation; polite)".to_string(),
@@ -173,7 +182,8 @@ mod tests {
     #[test]
     fn defaults_when_empty() {
         let cfg = Config::try_from_str("").unwrap();
-        assert_eq!(cfg.general.base_url, "https://student.unnes.ac.id");
+        assert_eq!(cfg.general.base_url, "https://apps.unnes.ac.id");
+        assert!(cfg.general.auto_relogin);
         assert_eq!(cfg.general.default_interval, 900);
         assert!(cfg.pages.is_empty());
         assert!(cfg.notify.command.is_none());

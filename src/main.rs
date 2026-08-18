@@ -335,6 +335,7 @@ fn cmd_logout(home: &UnnesHome, profile: &str) -> Result<()> {
 
 /// unnes status: session state from the saved jar + login metadata.
 fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
+    let cfg = Config::load(home)?;
     let jar = home.profile_jar_file(profile);
     if !jar.is_file() {
         if json_out {
@@ -370,6 +371,18 @@ fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
     } else {
         None
     };
+    // Auto re-login for status: try the scripted login before declaring EXPIRED.
+    if !valid && cfg.general.auto_relogin {
+        let _ = watch::auto_login(home, profile);
+        let mut job = fetcher::job("get", profile);
+        job["url"] = json!("https://apps.unnes.ac.id/gate/list");
+        if let Ok(res) = fetcher::run_job(home, profile, job) {
+            valid = res.ok && !res.session_expired;
+            if res.session_expired {
+                probe_err = "gateway session ended".into();
+            }
+        }
+    }
     if !valid {
         if json_out {
             println!("{}", serde_json::to_string_pretty(&json!({
@@ -417,7 +430,14 @@ fn cmd_fetch(home: &UnnesHome, profile: &str, page_id: &str, csv: bool, json_out
     // automatic sso_token exchange on session expiry. link_selector pages
     // become crawls (follow links, extract rows on each linked page).
     // Shared dispatch lives in watch::fetch_page (get/page/crawl + sso).
-    let res = watch::fetch_page(home, profile, page)?;
+    let mut res = watch::fetch_page(home, profile, page)?;
+    // Auto re-login: session expired -> scripted Google re-login (saved
+    // profile) -> one retry, when enabled.
+    if res.session_expired && cfg.general.auto_relogin {
+        if watch::auto_login(home, profile).is_ok() {
+            res = watch::fetch_page(home, profile, page)?;
+        }
+    }
     if !res.ok {
         let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
         if code == "session" {
