@@ -286,7 +286,7 @@ export interface RenderPageResult {
   [k: string]: unknown;
 }
 
-const LOGIN_MARKERS = /login dengan unnes-id|masukan email dan password|username\s+password|kebijakan privasi/i;
+const LOGIN_MARKERS = /login dengan unnes-id|masukan email dan password|username\s+password/i;
 
 async function launchContext(browserDir: string): Promise<unknown> {
   const chromium = await import("playwright").then(
@@ -562,4 +562,169 @@ export async function crawlPage(jarPath: string, browserDir: string, opts: Crawl
 
 async function safeUrl(P: { url(): Promise<string> }): Promise<string | null> {
   try { return await P.url(); } catch { return null; }
+}
+
+
+// ---------------------------------------------------------------------------
+// op: batch - render many pages in ONE persistent browser session.
+// SSO primes are deduplicated per gateway app (one elena handshake serves all
+// its pages), which is what makes watch passes fast. The jar is synced once.
+// ---------------------------------------------------------------------------
+
+export interface BatchEntry {
+  url: string;
+  ssoApp?: string;
+  preUrl?: string;
+  semester?: string;
+  extract?: { selector: string; fields?: Record<string, string> };
+  /** crawl mode: follow these links from the page (extract applied per page) */
+  linkSelector?: string;
+  maxLinks?: number;
+  waitMs?: number;
+}
+
+export interface BatchPageResult {
+  url: string;
+  ok: boolean;
+  finalUrl: string | null;
+  sessionExpired: boolean;
+  records: Record<string, string>[];
+  error?: { code: string; message: string };
+}
+
+export interface BatchResult {
+  contract: number;
+  ok: boolean;
+  op: "batch";
+  results: BatchPageResult[];
+  capturedCookies: number;
+  error?: { code: string; message: string };
+  [k: string]: unknown;
+}
+
+
+/** Crawl-mode batch entry: collect links from the current page and extract
+ * per linked page, merged with _source/_title (shared session). */
+async function batchCrawlLinks(
+  P: { goto(u: string, o?: unknown): Promise<unknown>; url(): Promise<string>; content(): Promise<string>; waitForSelector(s: string, o?: unknown): Promise<unknown>; evaluate(fn: string): Promise<unknown> },
+  entry: BatchEntry,
+  r: BatchPageResult,
+): Promise<void> {
+  const { extractRecords } = await import("./extract.js");
+  try {
+    await P.waitForSelector(entry.linkSelector!, { timeout: entry.waitMs ?? 15000 });
+  } catch {
+    r.error = { code: "usage", message: "no links matched selector '" + entry.linkSelector + "' on " + entry.url };
+    return;
+  }
+  const links = (await P.evaluate(
+    "(function(){var out=[];var seen={};document.querySelectorAll(SEL).forEach(function(a){var h=a.href||a.getAttribute('href');if(!h)return;var u=new URL(h,location.href);if(!/unnes\.ac\.id$/.test(u.hostname))return;if(seen[u.href])return;seen[u.href]=1;out.push({href:u.href,text:(a.innerText||a.textContent||'').replace(/\s+/g,' ').trim().slice(0,120)});});return out;})()"
+      .replace("SEL", JSON.stringify(entry.linkSelector)),
+  )) as { href: string; text: string }[];
+  const maxLinks = entry.maxLinks ?? 50;
+  const records: Record<string, string>[] = [];
+  for (const link of links.slice(0, maxLinks)) {
+    try {
+      await P.goto(link.href, { waitUntil: "domcontentloaded", timeout: 60000 });
+    } catch { continue; }
+    if (entry.extract?.selector) {
+      try { await P.waitForSelector(entry.extract.selector, { timeout: entry.waitMs ?? 15000 }); } catch { continue; }
+    }
+    const html = await P.content();
+    const recs = extractRecords(html, entry.extract ?? { selector: "body" });
+    for (const rec of recs) {
+      records.push({ ...rec, _source: link.href, _title: link.text });
+    }
+  }
+  r.finalUrl = await P.url();
+  r.records = records;
+}
+export async function batchPages(
+  jarPath: string,
+  browserDir: string,
+  entries: BatchEntry[],
+  hubUrl: string = "https://apps.unnes.ac.id",
+): Promise<BatchResult> {
+  const fail = (code: string, message: string): BatchResult => ({
+    contract: 1, ok: false, op: "batch", results: [], capturedCookies: 0, error: { code, message },
+  });
+  if (process.env.UNNES_NO_BROWSER) {
+    return fail("usage", "batch render disabled via UNNES_NO_BROWSER");
+  }
+  let ctx: unknown;
+  try {
+    ctx = await launchContext(browserDir);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return fail("usage", message);
+  }
+  const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
+  const P = page as {
+    goto(u: string, o?: unknown): Promise<unknown>;
+    url(): Promise<string>;
+    content(): Promise<string>;
+    waitForSelector(s: string, o?: unknown): Promise<unknown>;
+    evaluate(fn: string): Promise<unknown>;
+  };
+  const primed = new Set<string>();
+  const results: BatchPageResult[] = [];
+  try {
+    for (const entry of entries) {
+      const r: BatchPageResult = { url: entry.url, ok: false, finalUrl: null, sessionExpired: false, records: [] };
+      try {
+        // 1. prime the app session once per ssoApp
+        if (entry.ssoApp && !primed.has(entry.ssoApp)) {
+          await P.goto(hubUrl + "/" + entry.ssoApp, { waitUntil: "domcontentloaded", timeout: 60000 });
+          await new Promise((r) => setTimeout(r, 6000));
+          if (entry.ssoApp === "30") {
+            await completeElenaSession(page as never, entry.semester ?? "20261");
+          }
+          primed.add(entry.ssoApp);
+        }
+        if (entry.preUrl) {
+          await P.goto(entry.preUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+          await new Promise((r) => setTimeout(r, 2500));
+        }
+        // 2. the page itself (crawl mode: follow links, extract per page)
+        await P.goto(entry.url, { waitUntil: "domcontentloaded", timeout: 60000 });
+        if (entry.linkSelector) {
+          await batchCrawlLinks(P, entry, r);
+        } else {
+          if (entry.extract?.selector) {
+            try {
+              await P.waitForSelector(entry.extract.selector, { timeout: entry.waitMs ?? 15000 });
+            } catch { /* zero matches is valid */ }
+          }
+          const html = await P.content();
+          r.finalUrl = await P.url();
+          // 3. session health
+          const body = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
+          const landedOnGateway = (r.finalUrl ?? "").startsWith("https://apps.unnes.ac.id");
+          r.sessionExpired = (landedOnGateway && LOGIN_MARKERS.test(body)) || /\/auth\/login/i.test(r.finalUrl ?? "");
+          if (r.sessionExpired) {
+            results.push(r);
+            continue;
+          }
+          if (entry.extract) {
+            const { extractRecords } = await import("./extract.js");
+            r.records = extractRecords(html, entry.extract);
+          }
+        }
+        r.ok = true;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        r.error = { code: "network", message: message.slice(0, 200) };
+      }
+      results.push(r);
+    }
+    const jar = await CookieJar.load(jarPath);
+    const captured = await syncJarFromContext(ctx, jar);
+    await jar.save(jarPath);
+    return { contract: 1, ok: true, op: "batch", results, capturedCookies: captured };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return fail("internal", "batch render failed: " + message);
+  } finally {
+    try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
+  }
 }

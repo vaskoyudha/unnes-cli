@@ -59,6 +59,9 @@ pub struct JobResult {
     pub records: Vec<Value>,
     /// normalized page text (op=get only)
     pub normalized: Option<String>,
+    /// op=batch: per-page results
+    #[serde(default)]
+    pub results: Vec<BatchPageResult>,
     pub landing_url: Option<String>,
     pub captured_cookies: Option<u64>,
     pub mode: Option<String>,
@@ -69,6 +72,31 @@ pub struct JobResult {
 pub struct JobError {
     pub code: String,
     pub message: String,
+}
+
+/// One page's outcome inside an op=batch result.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchPageResult {
+    pub url: String,
+    pub ok: bool,
+    pub final_url: Option<String>,
+    #[serde(default)]
+    pub session_expired: bool,
+    #[serde(default)]
+    pub records: Vec<Value>,
+    pub error: Option<JobError>,
+}
+
+/// Result of op=batch.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchResult {
+    pub ok: bool,
+    #[serde(default)]
+    pub results: Vec<BatchPageResult>,
+    pub captured_cookies: Option<u64>,
+    pub error: Option<JobError>,
 }
 
 /// Run one job against the fetcher; returns the parsed result.

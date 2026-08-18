@@ -31,16 +31,8 @@ pub struct WatchOutcome {
     pub summary: String,
 }
 
-/// Fetch one configured page using the same dispatch as `unnes fetch`
-/// (plain HTTP with auto sso bootstrap, browser render, or crawl).
-pub fn fetch_page(home: &UnnesHome, profile: &str, page: &Page) -> Result<JobResult> {
-    let mut job = if page.link_selector.is_some() {
-        fetcher::job("crawl", profile)
-    } else if page.render.unwrap_or(false) {
-        fetcher::job("page", profile)
-    } else {
-        fetcher::job("get", profile)
-    };
+/// Build the per-page job/entry fields shared by get/page/crawl/batch.
+fn page_fields(job: &mut Value, page: &Page) {
     job["url"] = json!(page.url);
     if let Some(sel) = &page.selector {
         job["extract"] = json!({ "selector": sel });
@@ -60,6 +52,19 @@ pub fn fetch_page(home: &UnnesHome, profile: &str, page: &Page) -> Result<JobRes
     if let Some(sem) = &page.sso_semester {
         job["semester"] = json!(sem);
     }
+}
+
+/// Fetch one configured page using the same dispatch as `unnes fetch`
+/// (plain HTTP with auto sso bootstrap, browser render, or crawl).
+pub fn fetch_page(home: &UnnesHome, profile: &str, page: &Page) -> Result<JobResult> {
+    let mut job = if page.link_selector.is_some() {
+        fetcher::job("crawl", profile)
+    } else if page.render.unwrap_or(false) {
+        fetcher::job("page", profile)
+    } else {
+        fetcher::job("get", profile)
+    };
+    page_fields(&mut job, page);
     let res = fetcher::run_job(home, profile, job)?;
     if !res.ok {
         let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
@@ -67,6 +72,27 @@ pub fn fetch_page(home: &UnnesHome, profile: &str, page: &Page) -> Result<JobRes
         bail!("{msg} ({code})");
     }
     Ok(res)
+}
+
+/// One batch job entry for a render/crawl page.
+fn batch_entry(page: &Page) -> Value {
+    let mut e = json!({ "url": page.url });
+    if let Some(sel) = &page.selector {
+        e["extract"] = json!({ "selector": sel });
+    }
+    if let Some(app) = &page.sso_app {
+        e["ssoApp"] = json!(app);
+    }
+    if let Some(sel) = &page.link_selector {
+        e["linkSelector"] = json!(sel);
+    }
+    if let Some(pre) = &page.pre_url {
+        e["preUrl"] = json!(pre);
+    }
+    if let Some(sem) = &page.sso_semester {
+        e["semester"] = json!(sem);
+    }
+    e
 }
 
 fn snapshot_path(home: &UnnesHome, page_id: &str) -> std::path::PathBuf {
@@ -115,12 +141,101 @@ fn notify(home: &UnnesHome, entry: &ChangelogEntry) -> Result<()> {
     Ok(())
 }
 
+/// Diff + snapshot + changelog + notify for one fetched page.
+fn handle_result(
+    home: &UnnesHome,
+    page: &Page,
+    records: Vec<Value>,
+    normalized: Option<String>,
+    session_expired: bool,
+    challenge: bool,
+) -> WatchOutcome {
+    if session_expired {
+        return WatchOutcome { page_id: page.id.clone(), changed: false, summary: "session expired; run: unnes login".into() };
+    }
+    if challenge {
+        return WatchOutcome { page_id: page.id.clone(), changed: false, summary: "Cloudflare challenge; backing off".into() };
+    }
+
+    let path = snapshot_path(home, &page.id);
+    let (old_records, old_norm) = load_snapshot(&path);
+
+    let diff = if page.selector.is_some() || page.link_selector.is_some() {
+        diff_records(&old_records, &records, page.key_field.as_deref())
+    } else if let Some(norm) = &normalized {
+        let old = old_norm.unwrap_or_default();
+        diff_lines(&old, norm)
+    } else {
+        diff_records(&old_records, &records, page.key_field.as_deref())
+    };
+
+    let changed = has_changes(&diff);
+    let summary;
+    if changed {
+        let entry = ChangelogEntry {
+            at: chrono::Utc::now().to_rfc3339(),
+            page_id: page.id.clone(),
+            event: "changed".to_string(),
+            added: diff.added.clone(),
+            removed: diff.removed.clone(),
+            changed_records: diff.changed.clone(),
+            lines_added: diff.lines_added.clone(),
+            lines_removed: diff.lines_removed.clone(),
+        };
+        let _ = changelog::append(home, &entry);
+        let _ = notify(home, &entry);
+        summary = entry.summary();
+    } else {
+        summary = "no change".to_string();
+    }
+
+    if let Err(e) = save_snapshot(&path, &records, normalized.as_deref()) {
+        return WatchOutcome { page_id: page.id.clone(), changed, summary: format!("snapshot error: {e:#}") };
+    }
+    WatchOutcome { page_id: page.id.clone(), changed, summary }
+}
+
 /// One watch pass over all (or one) configured pages.
+///
+/// Render/crawl pages share ONE persistent browser session (op=batch, SSO
+/// primes deduplicated); plain pages are fetched over plain HTTP individually.
 pub fn run_pass(home: &UnnesHome, profile: &str, only: Option<&str>) -> Result<Vec<WatchOutcome>> {
     let cfg = Config::load(home)?;
+    let pages: Vec<&Page> = cfg.pages.iter().filter(|p| only.map_or(true, |id| p.id == id)).collect();
     let mut out = Vec::new();
-    for page in cfg.pages.iter().filter(|p| only.map_or(true, |id| p.id == id)) {
-        // 1. fetch
+
+    // Phase 1: render/crawl pages in a single browser session.
+    let render_pages: Vec<&Page> = pages.iter().filter(|p| p.render.unwrap_or(false) || p.link_selector.is_some()).copied().collect();
+    if !render_pages.is_empty() {
+        let mut job = fetcher::job("batch", profile);
+        job["entries"] = json!(render_pages.iter().map(|p| batch_entry(p)).collect::<Vec<_>>());
+        match fetcher::run_job(home, profile, job) {
+            Ok(res) if res.ok => {
+                let by_url: std::collections::HashMap<&str, &fetcher::BatchPageResult> =
+                    res.results.iter().map(|r| (r.url.as_str(), r)).collect();
+                for page in &render_pages {
+                    match by_url.get(page.url.as_str()) {
+                        Some(r) => out.push(handle_result(home, page, r.records.clone(), None, r.session_expired, false)),
+                        None => out.push(WatchOutcome { page_id: page.id.clone(), changed: false, summary: "ERROR: batch returned no result for this page".into() }),
+                    }
+                }
+            }
+            Ok(res) => {
+                let msg = res.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+                for page in &render_pages {
+                    out.push(WatchOutcome { page_id: page.id.clone(), changed: false, summary: format!("ERROR: {msg}") });
+                }
+            }
+            Err(e) => {
+                for page in &render_pages {
+                    out.push(WatchOutcome { page_id: page.id.clone(), changed: false, summary: format!("ERROR: {e:#}") });
+                }
+            }
+        }
+    }
+
+    // Phase 2: plain pages one by one.
+    for page in pages.iter().filter(|p| !(p.render.unwrap_or(false) || p.link_selector.is_some())) {
         let res = match fetch_page(home, profile, page) {
             Ok(r) => r,
             Err(e) => {
@@ -128,54 +243,9 @@ pub fn run_pass(home: &UnnesHome, profile: &str, only: Option<&str>) -> Result<V
                 continue;
             }
         };
-        if res.session_expired {
-            out.push(WatchOutcome { page_id: page.id.clone(), changed: false, summary: "session expired; run: unnes login".into() });
-            continue;
-        }
-        if res.challenge {
-            out.push(WatchOutcome { page_id: page.id.clone(), changed: false, summary: "Cloudflare challenge; backing off".into() });
-            continue;
-        }
-
-        // 2. diff against the snapshot
-        let path = snapshot_path(home, &page.id);
-        let (old_records, old_norm) = load_snapshot(&path);
-        let new_records = res.records.clone();
-        let new_norm = res.normalized.clone();
-
-        let diff = if page.selector.is_some() || page.link_selector.is_some() {
-            diff_records(&old_records, &new_records, page.key_field.as_deref())
-        } else if let Some(norm) = &new_norm {
-            let old = old_norm.unwrap_or_default();
-            diff_lines(&old, norm)
-        } else {
-            diff_records(&old_records, &new_records, page.key_field.as_deref())
-        };
-
-        let changed = has_changes(&diff);
-        if changed {
-            let entry = ChangelogEntry {
-                at: chrono::Utc::now().to_rfc3339(),
-                page_id: page.id.clone(),
-                event: "changed".to_string(),
-                added: diff.added.clone(),
-                removed: diff.removed.clone(),
-                changed_records: diff.changed.clone(),
-                lines_added: diff.lines_added.clone(),
-                lines_removed: diff.lines_removed.clone(),
-            };
-            changelog::append(home, &entry)?;
-            notify(home, &entry)?;
-            out.push(WatchOutcome { page_id: page.id.clone(), changed: true, summary: entry.summary() });
-        } else {
-            out.push(WatchOutcome { page_id: page.id.clone(), changed: false, summary: "no change".to_string() });
-        }
-
-        // 3. persist the fresh snapshot (baseline stays current)
-        if let Err(e) = save_snapshot(&path, &new_records, new_norm.as_deref()) {
-            out.push(WatchOutcome { page_id: page.id.clone(), changed: false, summary: format!("snapshot error: {e:#}") });
-        }
+        out.push(handle_result(home, page, res.records.clone(), res.normalized.clone(), res.session_expired, res.challenge));
     }
+
     Ok(out)
 }
 

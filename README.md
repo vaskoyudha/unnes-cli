@@ -36,7 +36,13 @@ A TUI is explicitly out of v1.
 
 - Rust 1.97+ (cargo build --release -> target/release/unnes)
 - Node.js >= 20 (fetch arm: cd fetcher && npm ci && npm run build)
-- Chromium for the SSO login step (one time: cd fetcher && npx playwright install chromium)
+- Chromium for the SSO login step (one time: make chromium)
+
+## Install
+
+    make build fetcher      # release binary + fetcher dist
+    make install            # -> ~/.cargo/bin/unnes
+    make test               # full Rust + fetcher suites
 
 ## Login & the browser profile
 
@@ -63,6 +69,25 @@ uploaded or committed (gitignored).
 
 Exit codes: 0 ok, 1 generic, 2 usage, 3 not logged in, 4 session expired,
 5 network/429/challenge, 6 selector matched nothing (page may have changed).
+
+## Command reference
+
+    unnes login                 Google SSO login (headed browser, persistent profile)
+    unnes logout                clear the saved session
+    unnes status [--json]       session state + SSO landing URL
+    unnes fetch <page-id>       fetch one configured page (table/--csv/--json)
+    unnes grades|schedule|announcements   aliases for fetch <id>
+    unnes watch add <id> --url=... --selector=... [--render --sso-app --sso-semester
+                                --pre-url --link-selector --interval --key-field]
+    unnes watch rm <id>
+    unnes watch list
+    unnes watch run [--page-id] one pass: fetch -> diff -> changelog -> notify
+    unnes watch daemon          adaptive polling loop (jitter + adaptive windows)
+    unnes discover [--elena]    list gateway apps / elena courses + watch recipes
+    unnes changelog [--since=... --page-id=...]
+
+Render/crawl pages in one watch pass share a single browser session (op=batch),
+so the Elena SSO handshake runs once, not per page.
 
 ## Scraping mechanism (verified against the live portal)
 

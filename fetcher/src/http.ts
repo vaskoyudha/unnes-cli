@@ -112,7 +112,9 @@ export class HttpFetcher {
       const finalUrl = isRedirect ? new URL(loc!, res.url).href : res.url;
       const final = new URL(finalUrl);
       const challenge = res.status === 403 && /cf-chl|just a moment|enable javascript|attention required/i.test(html);
-      const redirectedToLogin = final.pathname.startsWith("/auth/login") && !requested.pathname.startsWith("/auth/login");
+      // Login pages: Laravel /auth/login and the gateway's /login.
+      const isLoginPath = (p: string) => p === "/login" || p.startsWith("/login/") || p.startsWith("/auth/login");
+      const redirectedToLogin = isLoginPath(final.pathname) && !isLoginPath(requested.pathname);
       const sessionExpired = redirectedToLogin || res.status === 401;
       let retryAfter: number | null = null;
       const ra = res.headers.get("retry-after");

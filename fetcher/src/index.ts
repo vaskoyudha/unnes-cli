@@ -8,7 +8,7 @@ import { ExtractSpec, extractRecords } from "./extract.js";
 
 export interface Job {
   contract: number;
-  op: "get" | "login" | "logout" | "sso" | "page" | "crawl";
+  op: "get" | "login" | "logout" | "sso" | "page" | "crawl" | "batch";
   profile?: string;
   /** used by login/logout when the job URL family is not explicit */
   baseUrl?: string;
@@ -32,6 +32,15 @@ export interface Job {
   preUrl?: string;
   /** op=page/crawl (elena): semester to open after SSO, default 20261 */
   semester?: string;
+  /** op=batch: entries to render in one shared browser session */
+  entries?: {
+    url: string;
+    ssoApp?: string;
+    preUrl?: string;
+    semester?: string;
+    extract?: ExtractSpec;
+    waitMs?: number;
+  }[];
 }
 
 export interface JobResult {
@@ -127,6 +136,14 @@ export async function processJob(job: Job): Promise<JobResult> {
         extract: job.extract,
         waitMs: job.waitMs,
       });
+    }
+    case "batch": {
+      if (!job.entries || job.entries.length === 0) {
+        return fail("usage", "op=batch requires entries");
+      }
+      const { batchPages } = await import("./browser.js");
+      const result = await batchPages(profilePath, browserDir, job.entries);
+      return result;
     }
     case "crawl": {
       if (!job.url || !job.linkSelector || !job.extract) {

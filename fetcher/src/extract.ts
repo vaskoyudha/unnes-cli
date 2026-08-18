@@ -19,8 +19,27 @@ export function extractRecords(html: string, spec: ExtractSpec): Record<string, 
     } else {
       for (const k of keys) {
         const sel = fields[k];
-        const text = sel && sel.trim() !== "" ? $(el).find(sel).first().text() : $(el).text();
-        rec[k] = text.replace(/\s+/g, " ").trim();
+        if (!sel || sel.trim() === "") {
+          rec[k] = $(el).text().replace(/\s+/g, " ").trim();
+          continue;
+        }
+        // "@attr" extracts an attribute of the record element itself;
+        // "sel@attr" of the first matched descendant.
+        const at = sel.lastIndexOf("@");
+        if (sel.startsWith("@")) {
+          const attr = sel.slice(1);
+          const v = $(el).attr(attr) ?? "";
+          rec[k] = v.trim();
+          continue;
+        }
+        if (at > 0) {
+          const css = sel.slice(0, at);
+          const attr = sel.slice(at + 1);
+          const v = $(el).find(css).first().attr(attr) ?? "";
+          rec[k] = v.trim();
+          continue;
+        }
+        rec[k] = $(el).find(sel).first().text().replace(/\s+/g, " ").trim();
       }
     }
     out.push(rec);

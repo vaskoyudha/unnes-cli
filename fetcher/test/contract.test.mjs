@@ -271,6 +271,23 @@ test("browser login respects UNNES_NO_BROWSER (no browser launched)", async () =
 });
 
 
+test("batch render respects UNNES_NO_BROWSER (no browser launched)", async () => {
+  await withHome("nobatch", async () => {
+    process.env.UNNES_NO_BROWSER = "1";
+    try {
+      const res = await processJob({
+        contract: 1,
+        op: "batch",
+        entries: [{ url: "https://akademik.unnes.ac.id/krs-mahasiswa", ssoApp: "76", extract: { selector: "tbody tr" } }],
+      });
+      assert.equal(res.ok, false);
+      assert.equal(res.error.code, "usage");
+    } finally {
+      delete process.env.UNNES_NO_BROWSER;
+    }
+  });
+});
+
 test("page render respects UNNES_NO_BROWSER (no browser launched)", async () => {
   await withHome("nopagerender", async () => {
     process.env.UNNES_NO_BROWSER = "1";

@@ -62,8 +62,10 @@ enum Cmd {
     Schedule(ScheduleArgs),
     /// Fetch the announcements page (alias for fetch announcements).
     Announcements(PageAliasArgs),
-    /// Watch commands: add/rm/list/run/daemon. [M4]
+    /// Watch commands: add/rm/list/run/daemon.
     Watch(WatchArgs),
+    /// Discover gateway apps or elena courses and print watch recipes
+    Discover(DiscoverArgs),
     /// Print the change log.
     Changelog(ChangelogArgs),
 }
@@ -156,6 +158,16 @@ enum WatchCmd {
 }
 
 #[derive(Args)]
+struct DiscoverArgs {
+    /// List elena courses (requires a session) instead of gateway apps
+    #[arg(long)]
+    elena: bool,
+    /// Elena semester to open after SSO (default 20261)
+    #[arg(long)]
+    semester: Option<String>,
+}
+
+#[derive(Args)]
 struct ChangelogArgs {
     /// Only entries at or after this RFC3339 timestamp
     #[arg(long)]
@@ -227,6 +239,7 @@ fn run(cli: Cli) -> Result<()> {
             WatchCmd::Run { page_id } => cmd_watch_run(&home, &profile, page_id.as_deref(), cli.json),
             WatchCmd::Daemon => watch::daemon(&home, &profile),
         },
+        Cmd::Discover(a) => cmd_discover(&home, &profile, &a, cli.json),
         Cmd::Changelog(a) => changelog_list(&home, &a, cli.json),
     }
 }
@@ -367,6 +380,106 @@ fn cmd_fetch(home: &UnnesHome, profile: &str, page_id: &str, csv: bool, json_out
             return Err(app_err(6, format!("fetch {page_id}: no records matched selector '{sel}' - the page may have changed")));
         }
     }
+    Ok(())
+}
+
+fn slugify(name: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in name.chars() {
+        if ch.is_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    while out.ends_with('-') { out.pop(); }
+    out
+}
+
+/// unnes discover: list gateway apps or elena courses with ready-to-run
+/// watch add commands.
+fn cmd_discover(home: &UnnesHome, profile: &str, args: &DiscoverArgs, json_out: bool) -> Result<()> {
+    if !home.profile_jar_file(profile).is_file() {
+        return Err(app_err(3, format!("not logged in (profile {profile}); run: unnes login")));
+    }
+    let semester = args.semester.as_deref().unwrap_or("20261");
+    if args.elena {
+        let mut job = fetcher::job("page", profile);
+        job["url"] = json!("https://elena.unnes.ac.id/my/courses.php");
+        job["ssoApp"] = json!("30");
+        job["semester"] = json!(semester);
+        job["extract"] = json!({
+            "selector": "a[href*='/course/view.php']",
+            "fields": { "name": "", "url": "@href" },
+        });
+        let res = fetcher::run_job(home, profile, job)?;
+        if !res.ok {
+            let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
+            return Err(app_err(err_code_for(&code), format!("discover: {}", err_msg(&res))));
+        }
+        if res.session_expired {
+            return Err(app_err(4, "session expired; run: unnes login"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        for r in &res.records {
+            let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if name.is_empty() || url.is_empty() || !seen.insert(url.clone()) { continue; }
+            rows.push(serde_json::json!({ "name": name, "url": url, "suggested_id": slugify(&name) }));
+        }
+        if json_out {
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+            return Ok(());
+        }
+        println!("Elena courses ({}):", rows.len());
+        for r in &rows {
+            let name = r["name"].as_str().unwrap_or("");
+            let url = r["url"].as_str().unwrap_or("");
+            let id = r["suggested_id"].as_str().unwrap_or("");
+            println!("  {name}");
+            println!("    unnes watch add {id} --url={url} --selector=.activity-item --render --sso-app=30 --sso-semester={semester}");
+        }
+        return Ok(());
+    }
+
+    // Gateway apps (plain HTTP with the jar).
+    let mut job = fetcher::job("get", profile);
+    job["url"] = json!("https://apps.unnes.ac.id/gate/list");
+    job["extract"] = json!({
+        "selector": "a[href*='apps.unnes.ac.id/']",
+        "fields": { "name": "", "url": "@href" },
+    });
+    let res = fetcher::run_job(home, profile, job)?;
+    if !res.ok {
+        let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
+        return Err(app_err(err_code_for(&code), format!("discover: {}", err_msg(&res))));
+    }
+    if res.session_expired {
+        return Err(app_err(4, "session expired; run: unnes login"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for r in &res.records {
+        let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let app_id = url.rsplit('/').next().unwrap_or("");
+        if name.is_empty() || app_id.is_empty() || !app_id.chars().all(|c| c.is_ascii_digit()) { continue; }
+        if !seen.insert(app_id.to_string()) { continue; }
+        rows.push(serde_json::json!({ "id": app_id, "name": name }));
+    }
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    println!("UNNES gateway apps ({}):", rows.len());
+    for r in &rows {
+        println!("  {} = {}", r["id"].as_str().unwrap_or(""), r["name"].as_str().unwrap_or(""));
+    }
+    println!("prime a session with: unnes watch add <id> --url=<app-url> --render --sso-app=<app-id>");
     Ok(())
 }
 
