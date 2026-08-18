@@ -344,6 +344,24 @@ fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
     }
     let modified = jar.metadata()?.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let age_secs = SystemTime::now().duration_since(modified).unwrap_or_default().as_secs();
+
+    // Live session check: the gateway answers the app list only with a valid
+    // server-side session; jar-file existence alone is not proof.
+    let mut valid = false;
+    let mut probe_err = String::new();
+    {
+        let mut job = fetcher::job("get", profile);
+        job["url"] = json!("https://apps.unnes.ac.id/gate/list");
+        match fetcher::run_job(home, profile, job) {
+            Ok(res) => {
+                valid = res.ok && !res.session_expired;
+                if res.session_expired {
+                    probe_err = "gateway session ended".into();
+                }
+            }
+            Err(e) => probe_err = format!("{e:#}"),
+        }
+    }
     let meta_path = home.profile_meta_file(profile);
     let landing: Option<String> = if meta_path.is_file() {
         serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&meta_path)?)
@@ -352,6 +370,20 @@ fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
     } else {
         None
     };
+    if !valid {
+        if json_out {
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "profile": profile,
+                "logged_in": false,
+                "jar_age_seconds": age_secs,
+                "reason": probe_err,
+            }))?);
+        } else {
+            println!("profile: {profile}");
+            println!("session: EXPIRED ({probe_err}); run: unnes login");
+        }
+        return Err(app_err(4, "session expired; run: unnes login"));
+    }
     if json_out {
         println!("{}", serde_json::to_string_pretty(&json!({
             "profile": profile,
@@ -361,7 +393,7 @@ fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
         }))?);
     } else {
         println!("profile: {profile}");
-        println!("session: saved (jar updated {age_secs}s ago)");
+        println!("session: VALID (gateway confirmed)");
         match landing {
             Some(l) => println!("SSO landing: {l}"),
             None => println!("SSO landing: unknown (re-run unnes login)"),
