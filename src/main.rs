@@ -15,6 +15,7 @@ mod jadwal;
 mod kurikulum;
 mod output;
 mod paths;
+mod tugas;
 mod watch;
 
 use std::fs;
@@ -677,117 +678,10 @@ fn cmd_jadwal(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
 /// dates and submission status. New items appear here the moment the
 /// professor adds them (the watch crawl also logs them as changes).
 fn cmd_tugas(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
-    // 1. course ids from the stored elena-kursus crawl (_source urls)
-    let mut kursus: Vec<u32> = Vec::new();
-    if let Ok(Some(entry)) = crate::data::latest(home, "elena-kursus") {
-        for r in &entry.records {
-            let src = r.get("_source").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(id) = src.split("id=").nth(1).and_then(|x| x.split(['&', '#']).next()) {
-                if let Ok(n) = id.parse::<u32>() {
-                    if !kursus.contains(&n) {
-                        kursus.push(n);
-                    }
-                }
-            }
-        }
-    }
-    if kursus.is_empty() {
-        return Err(app_err(1, "tugas: no courses stored yet - run: unnes watch run (elena-kursus) or unnes discover --elena"));
-    }
-
-    // 2. collect assignment/quiz items per course (plain HTTP, Moodle
-    //    server-rendered; the elena session must be in the jar).
-    #[derive(serde::Serialize)]
-    struct Item {
-        course: String,
-        course_id: u32,
-        nama: String,
-        url: String,
-        due: String,
-        status: String,
-        kategori: String,
-    }
-    let mut items: Vec<Item> = Vec::new();
-    let mut session_ok = true;
-    for cid in &kursus {
-        let name = format!("course-{cid}");
-        for (kind, path) in [("Tugas", "mod/assign/index.php"), ("Kuis", "mod/quiz/index.php")] {
-            let mut job = fetcher::job("get", profile);
-            job["url"] = json!(format!("https://elena.unnes.ac.id/{path}?id={cid}"));
-            job["extract"] = json!({
-                "selector": format!("a[href*='{path}']"),
-                "fields": { "nama": "a", "url": "@href" },
-            });
-            let res = match fetcher::run_job(home, profile, job) {
-                Ok(r) => r,
-                Err(_) => { session_ok = false; continue; }
-            };
-            if res.session_expired || !res.ok {
-                session_ok = false;
-                continue;
-            }
-            for r in &res.records {
-                let nama = r.get("nama").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if nama.is_empty() || url.is_empty() || nama == "Course activities" {
-                    continue;
-                }
-                // only view.php links are concrete items
-                if !url.contains("view.php") {
-                    continue;
-                }
-                items.push(Item {
-                    course: name.clone(),
-                    course_id: *cid,
-                    nama,
-                    url,
-                    due: String::new(),
-                    status: String::new(),
-                    kategori: kind.to_string(),
-                });
-            }
-        }
-    }
-    if !session_ok {
-        return Err(app_err(4, "tugas: elena session unavailable; run: unnes login"));
-    }
-
-    // 3. per-item detail: due date + submission status from the view page.
-    let due_re = regex::Regex::new(r"(?i)(due date|batas waktu|jatuh tempo)\s*[:]?\s*([A-Za-z0-9:, ]{8,40})").unwrap();
-    let status_re = regex::Regex::new(r"(?i)(submission status|status pengumpulan)\s*[:]?\s*([A-Za-z ()]{3,40})").unwrap();
-    for it in items.iter_mut() {
-        let mut job = fetcher::job("get", profile);
-        job["url"] = json!(it.url);
-        let res = match fetcher::run_job(home, profile, job) {
-            Ok(r) if r.ok && !r.session_expired => r,
-            _ => continue,
-        };
-        let txt = res.normalized.unwrap_or_default().replace('<', " <");
-        let txt = regex::Regex::new(r"<[^>]*>").unwrap().replace_all(&txt, " ").to_string();
-        let txt = regex::Regex::new(r"\s+").unwrap().replace_all(&txt, " ").to_string();
-        if let Some(c) = due_re.captures(&txt) {
-            it.due = c[2].trim().to_string();
-        }
-        if let Some(c) = status_re.captures(&txt) {
-            it.status = c[2].trim().to_string();
-        }
-        if it.status.is_empty() {
-            let l = txt.to_lowercase();
-            if l.contains("submitted for grading") || l.contains("diserahkan untuk dinilai") {
-                it.status = "Submitted".into();
-            } else if l.contains("no attempt") || l.contains("not submitted") || l.contains("belum dikumpulkan") || l.contains("belum ada") {
-                it.status = "Belum dikumpulkan".into();
-            } else if l.contains("draft") {
-                it.status = "Draft".into();
-            }
-        }
-    }
-    // sort: unsubmitted first, then by due text
-    items.sort_by(|a, b| {
-        let pa = if a.status.is_empty() || a.status == "Belum dikumpulkan" || a.status == "Draft" { 0 } else { 1 };
-        let pb = if b.status.is_empty() || b.status == "Belum dikumpulkan" || b.status == "Draft" { 0 } else { 1 };
-        pa.cmp(&pb).then_with(|| a.due.cmp(&b.due))
-    });
+    let items = tugas::fetch_items(home, profile).map_err(|e| match format!("{e:#}") {
+        m if m.contains("session unavailable") => app_err(4, format!("tugas: {m}")),
+        m => app_err(1, format!("tugas: {m}")),
+    })?;
 
     if json_out {
         println!("{}", serde_json::to_string_pretty(&items)?);
