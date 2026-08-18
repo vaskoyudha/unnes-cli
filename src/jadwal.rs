@@ -35,36 +35,22 @@ pub struct JadwalInfo {
     pub sks_plan: u32,
 }
 
-/// Fetch the KRS form (plain HTTP; browser prime + retry on session miss)
-/// and return the weekly sessions plus the header info.
-pub fn fetch_and_parse(home: &UnnesHome, profile: &str, nim: &str) -> Result<(Vec<Sesi>, JadwalInfo)> {
+fn fetch_krs(home: &UnnesHome, profile: &str, nim: &str) -> Result<Option<(Vec<serde_json::Value>, String)>> {
     let url = format!("https://duanol.unnes.ac.id/v2/prakuliah/krs/form_isi_krs/{nim}.aspx");
-    let fetch = |u: &str| -> Result<Option<(Vec<serde_json::Value>, String)>> {
-        let mut job = fetcher::job("get", profile);
-        job["url"] = json!(u);
-        job["extract"] = json!({
-            "selector": "table tbody tr",
-            "fields": { "kode": "td:nth-child(3)", "nama": "td:nth-child(4)", "sks": "td:nth-child(5)", "jadwal": "td:nth-child(7)" },
-        });
-        let res = fetcher::run_job(home, profile, job)?;
-        if !res.ok || res.session_expired {
-            return Ok(None);
-        }
-        Ok(Some((res.records, res.normalized.unwrap_or_default())))
-    };
-    let mut data = fetch(&url)?;
-    if data.is_none() {
-        let _ = watch::ensure_session(home, profile);
-        let cfg = Config::load(home)?;
-        let page = cfg.pages.iter().find(|p| p.id == "sikadu-krs").cloned().unwrap_or_default();
-        let _ = watch::fetch_page(home, profile, &page);
-        data = fetch(&url)?;
-        if data.is_none() {
-            bail!("duanol session unavailable; run: unnes login");
-        }
+    let mut job = fetcher::job("get", profile);
+    job["url"] = json!(url);
+    job["extract"] = json!({
+        "selector": "table tbody tr",
+        "fields": { "kode": "td:nth-child(3)", "nama": "td:nth-child(4)", "sks": "td:nth-child(5)", "jadwal": "td:nth-child(7)" },
+    });
+    let res = fetcher::run_job(home, profile, job)?;
+    if !res.ok || res.session_expired {
+        return Ok(None);
     }
-    let (records, normalized) = data.unwrap();
+    Ok(Some((res.records, res.normalized.unwrap_or_default())))
+}
 
+fn parse_krs(records: Vec<serde_json::Value>, normalized: String) -> (Vec<Sesi>, JadwalInfo) {
     let mut sesi: Vec<Sesi> = Vec::new();
     for r in &records {
         let nama = r.get("nama").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -77,7 +63,6 @@ pub fn fetch_and_parse(home: &UnnesHome, profile: &str, nim: &str) -> Result<(Ve
     }
     sesi.sort_by(|a, b| (hari_urutan(&a.hari), &a.mulai, &a.mata_kuliah).cmp(&(hari_urutan(&b.hari), &b.mulai, &b.mata_kuliah)));
 
-    // Header info: "Semester ke-5 3.58 24 SKS"
     let mut info = JadwalInfo::default();
     let tags = regex::Regex::new(r"<[^>]*>").unwrap();
     let flat = regex::Regex::new(r"\s+").unwrap().replace_all(&tags.replace_all(&normalized, " "), " ").to_string();
@@ -86,7 +71,33 @@ pub fn fetch_and_parse(home: &UnnesHome, profile: &str, nim: &str) -> Result<(Ve
         info.ipk = c[2].parse().unwrap_or(0.0);
         info.sks_plan = c[3].parse().unwrap_or(0);
     }
-    Ok((sesi, info))
+    (sesi, info)
+}
+
+/// One plain-HTTP fetch (NO browser prime - fast, for the TUI).
+pub fn fetch_plain(home: &UnnesHome, profile: &str, nim: &str) -> Result<(Vec<Sesi>, JadwalInfo)> {
+    match fetch_krs(home, profile, nim)? {
+        Some((records, normalized)) => Ok(parse_krs(records, normalized)),
+        None => bail!("duanol session unavailable; run: unnes login"),
+    }
+}
+
+/// Fetch the KRS form (plain HTTP; browser prime + retry on session miss)
+/// and return the weekly sessions plus the header info.
+pub fn fetch_and_parse(home: &UnnesHome, profile: &str, nim: &str) -> Result<(Vec<Sesi>, JadwalInfo)> {
+    let mut data = fetch_krs(home, profile, nim)?;
+    if data.is_none() {
+        let _ = watch::ensure_session(home, profile);
+        let cfg = Config::load(home)?;
+        let page = cfg.pages.iter().find(|p| p.id == "sikadu-krs").cloned().unwrap_or_default();
+        let _ = watch::fetch_page(home, profile, &page);
+        data = fetch_krs(home, profile, nim)?;
+        if data.is_none() {
+            bail!("duanol session unavailable; run: unnes login");
+        }
+    }
+    let (records, normalized) = data.unwrap();
+    Ok(parse_krs(records, normalized))
 }
 /// Parse one course's jadwal cell into sessions.
 /// Example cell: "D.1-502 - Selasa, pk. 13:00 WIB, 2 SKS TeoriD.1-502 - Selasa, pk. 15:00 WIB, 1 SKS Praktik"

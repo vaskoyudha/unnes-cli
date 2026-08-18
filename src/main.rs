@@ -16,6 +16,7 @@ mod kurikulum;
 mod output;
 mod paths;
 mod tugas;
+mod tui;
 mod watch;
 
 use std::fs;
@@ -78,6 +79,8 @@ enum Cmd {
     Jadwal,
     /// Tugas: Elena assignments/quizzes with deadlines and submission status
     Tugas,
+    /// TUI: interactive dashboard (ratatui)
+    Tui,
     /// Print the change log.
     Changelog(ChangelogArgs),
 }
@@ -286,6 +289,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Kurikulum => cmd_kurikulum(&home, &profile, cli.json),
         Cmd::Jadwal => cmd_jadwal(&home, &profile, cli.json),
         Cmd::Tugas => cmd_tugas(&home, &profile, cli.json),
+        Cmd::Tui => tui::run(&home, &profile),
         Cmd::Changelog(a) => changelog_list(&home, &a, cli.json),
     }
 }

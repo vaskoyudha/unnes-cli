@@ -68,6 +68,34 @@ pub fn resolve_nim(home: &UnnesHome) -> Option<String> {
     None
 }
 
+/// One plain-HTTP fetch of the curriculum page (NO browser prime - fast,
+/// used by the TUI where a slow re-authentication would block the screen).
+pub fn fetch_plain(home: &UnnesHome, profile: &str, nim: &str) -> Result<Vec<Kursus>> {
+    let url = format!("https://duanol.unnes.ac.id/v2/prakuliah/kurikulum/get_kurikulum_mhs/{nim}.aspx");
+    let fetch = |u: &str| -> Result<(bool, String)> {
+        let mut job = fetcher::job("get", profile);
+        job["url"] = json!(u);
+        let res = fetcher::run_job(home, profile, job)?;
+        if !res.ok {
+            let msg = res.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+            return Ok((false, msg));
+        }
+        if res.session_expired {
+            return Ok((false, "session expired".into()));
+        }
+        Ok((true, res.normalized.unwrap_or_default()))
+    };
+    let (ok, text) = fetch(&url)?;
+    if !ok {
+        bail!("duanol session unavailable; run: unnes login");
+    }
+    let kursus = parse_curriculum(&text);
+    if kursus.is_empty() {
+        bail!("no courses parsed - the page structure may have changed");
+    }
+    Ok(kursus)
+}
+
 /// Fetch the curriculum page (plain HTTP; browser prime + retry when the
 /// duanol session is missing) and parse every course.
 pub fn fetch_and_parse(home: &UnnesHome, profile: &str, nim: &str) -> Result<Vec<Kursus>> {
