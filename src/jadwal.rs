@@ -83,11 +83,13 @@ pub fn fetch_plain(home: &UnnesHome, profile: &str, nim: &str) -> Result<(Vec<Se
 }
 
 /// Fetch the KRS form (plain HTTP; browser prime + retry on session miss)
-/// and return the weekly sessions plus the header info.
-pub fn fetch_and_parse(home: &UnnesHome, profile: &str, nim: &str) -> Result<(Vec<Sesi>, JadwalInfo)> {
+/// and return the weekly sessions plus the header info. `interactive`
+/// controls whether a lapsed gateway session may open a click-waiting window
+/// (false in the TUI, which must never block on the user).
+pub fn fetch_and_parse(home: &UnnesHome, profile: &str, nim: &str, interactive: bool) -> Result<(Vec<Sesi>, JadwalInfo)> {
     let mut data = fetch_krs(home, profile, nim)?;
     if data.is_none() {
-        let _ = watch::ensure_session(home, profile);
+        let _ = watch::ensure_session(home, profile, interactive);
         let cfg = Config::load(home)?;
         let page = cfg.pages.iter().find(|p| p.id == "sikadu-krs").cloned().unwrap_or_default();
         let _ = watch::fetch_page(home, profile, &page);

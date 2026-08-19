@@ -9,6 +9,7 @@
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -75,19 +76,31 @@ pub fn fetch_page(home: &UnnesHome, profile: &str, page: &Page) -> Result<JobRes
     Ok(res)
 }
 
+/// When the last login attempt happened (unix ms). Non-interactive callers
+/// (the TUI dashboard) skip a second attempt within 4 minutes: a failed
+/// scripted login is expensive (~80s) and repeating it per source would
+/// stall every remaining panel.
+static LAST_LOGIN_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Session refresh using the SAVED profile:
-/// 1. headless scripted attempt (zero interaction when Google cooperates),
-/// 2. fall back to the headed window automatically when Google demands
-///    interaction (password/2FA/CAPTCHA) - the user just clicks once.
-pub fn auto_login(home: &UnnesHome, profile: &str) -> Result<String> {
+/// 1. scripted attempts (zero interaction when Google cooperates),
+/// 2. when `interactive`, fall back to the headed window automatically if
+///    Google demands interaction (password/2FA/CAPTCHA) - the user clicks
+///    once. When not interactive (e.g. the TUI dashboard), the retry fails
+///    with needsInteraction instead of blocking on a human click.
+pub fn auto_login(home: &UnnesHome, profile: &str, interactive: bool) -> Result<String> {
+    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        LAST_LOGIN_ATTEMPT_MS.store(now.as_millis() as u64, Ordering::Relaxed);
+    }
     let mut job = fetcher::job("login", profile);
     job["mode"] = json!("auto");
+    job["interactive"] = json!(interactive);
     match fetcher::run_job(home, profile, job) {
-        Ok(res) if res.ok => Ok("re-login ok (headless)".to_string()),
+        Ok(res) if res.ok => Ok("re-login ok (scripted)".to_string()),
         Ok(res) => {
             let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
             let msg = res.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
-            if code == "needsInteraction" {
+            if code == "needsInteraction" && interactive {
                 // Google wants a real click: open the headed window automatically.
                 let mut hjob = fetcher::job("login", profile);
                 hjob["mode"] = json!("browser");
@@ -107,8 +120,9 @@ pub fn auto_login(home: &UnnesHome, profile: &str) -> Result<String> {
 
 /// Best-effort: if the gateway session is expired and auto_relogin is enabled,
 /// run the scripted re-login once. Errors are swallowed here - the per-page
-/// outcomes still report session problems honestly.
-pub fn ensure_session(home: &UnnesHome, profile: &str) {
+/// outcomes still report session problems honestly. `interactive` controls
+/// whether the re-login may open a window that waits for a human click.
+pub fn ensure_session(home: &UnnesHome, profile: &str, interactive: bool) {
     let Ok(cfg) = Config::load(home) else { return };
     if !cfg.general.auto_relogin {
         return;
@@ -120,7 +134,19 @@ pub fn ensure_session(home: &UnnesHome, profile: &str) {
         Err(_) => false,
     };
     if expired {
-        let _ = auto_login(home, profile);
+        if !interactive {
+            // A scripted login takes up to ~80s; without this guard every
+            // remaining source (jadwal, tugas) would repeat a failed attempt.
+            let last = LAST_LOGIN_ATTEMPT_MS.load(Ordering::Relaxed);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if last != 0 && now.saturating_sub(last) < 240_000 {
+                return;
+            }
+        }
+        let _ = auto_login(home, profile, interactive);
     }
 }
 
@@ -254,7 +280,7 @@ fn handle_result(
 /// primes deduplicated); plain pages are fetched over plain HTTP individually.
 pub fn run_pass(home: &UnnesHome, profile: &str, only: Option<&str>) -> Result<Vec<WatchOutcome>> {
     let cfg = Config::load(home)?;
-    ensure_session(home, profile);
+    ensure_session(home, profile, true);
     let pages: Vec<&Page> = cfg.pages.iter().filter(|p| only.map_or(true, |id| p.id == id)).collect();
     let mut out = Vec::new();
 

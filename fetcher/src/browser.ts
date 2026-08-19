@@ -751,7 +751,11 @@ export async function batchPages(
 // needsInteraction and the caller falls back to the headed browser login.
 // ---------------------------------------------------------------------------
 
-export async function autoLogin(jarPath: string, browserDir: string): Promise<BrowserLoginResult> {
+export async function autoLogin(
+  jarPath: string,
+  browserDir: string,
+  opts: { interactive?: boolean } = {},
+): Promise<BrowserLoginResult> {
   const fail = (code: string, message: string): BrowserLoginResult => ({
     contract: 1, ok: false, mode: "browser", landingUrl: null, capturedCookies: 0, error: { code, message },
   });
@@ -763,6 +767,12 @@ export async function autoLogin(jarPath: string, browserDir: string): Promise<Br
   {
     const res = await scriptedOAuth(jarPath, browserDir, true);
     if (res) return res;
+  }
+
+  if (opts.interactive === false) {
+    // Callers that must never block on a human (e.g. the TUI dashboard)
+    // stop here: NO headed attempt, no window that waits for a click.
+    return fail("needsInteraction", "Google asked for human interaction (password/2FA/CAPTCHA); run: unnes login");
   }
 
   // 2. Headed attempt via the hub's own Google button: gapi's onSignIn keeps

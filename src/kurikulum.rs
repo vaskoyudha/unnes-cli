@@ -97,8 +97,10 @@ pub fn fetch_plain(home: &UnnesHome, profile: &str, nim: &str) -> Result<Vec<Kur
 }
 
 /// Fetch the curriculum page (plain HTTP; browser prime + retry when the
-/// duanol session is missing) and parse every course.
-pub fn fetch_and_parse(home: &UnnesHome, profile: &str, nim: &str) -> Result<Vec<Kursus>> {
+/// duanol session is missing) and parse every course. `interactive` controls
+/// whether a lapsed gateway session may open a window that waits for a click
+/// (false in the TUI, which must never block on the user).
+pub fn fetch_and_parse(home: &UnnesHome, profile: &str, nim: &str, interactive: bool) -> Result<Vec<Kursus>> {
     let url = format!("https://duanol.unnes.ac.id/v2/prakuliah/kurikulum/get_kurikulum_mhs/{nim}.aspx");
     let fetch = |u: &str| -> Result<(bool, String)> {
         let mut job = fetcher::job("get", profile);
@@ -115,7 +117,7 @@ pub fn fetch_and_parse(home: &UnnesHome, profile: &str, nim: &str) -> Result<Vec
     };
     let (mut ok, mut text) = fetch(&url)?;
     if !ok {
-        let _ = watch::ensure_session(home, profile);
+        let _ = watch::ensure_session(home, profile, interactive);
         let cfg = Config::load(home)?;
         let page = cfg.pages.iter().find(|p| p.id == "sikadu-krs").cloned().unwrap_or_default();
         let _ = watch::fetch_page(home, profile, &page);

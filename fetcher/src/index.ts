@@ -15,6 +15,9 @@ export interface Job {
   url?: string;
   /** login: "form" (legacy email/password, default) or "browser" (Google SSO via Playwright) */
   mode?: "form" | "browser" | "auto";
+  /** login mode=auto: never open an INTERACTIVE window - scripted attempts
+   * only (used by callers that must not block on a human click, e.g. the TUI) */
+  interactive?: boolean;
   form?: LoginForm;
   extract?: ExtractSpec;
   extraRegexes?: string[];
@@ -170,9 +173,11 @@ export async function processJob(job: Job): Promise<JobResult> {
       }
       if (job.mode === "auto") {
         // Scripted headless re-login with the saved profile; falls back to
-        // needsInteraction when Google asks for password/2FA/CAPTCHA.
+        // needsInteraction when Google asks for password/2FA/CAPTCHA -
+        // unless interactive:false, in which case it stops there instead of
+        // opening a window that waits for a human click.
         const { autoLogin } = await import("./browser.js");
-        return autoLogin(profilePath, browserDir);
+        return autoLogin(profilePath, browserDir, { interactive: job.interactive ?? true });
       }
       if (!job.form) return fail("usage", "op=login requires form{email,password}");
       const jar = await CookieJar.load(profilePath);

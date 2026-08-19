@@ -389,7 +389,7 @@ fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
     };
     // Auto re-login for status: try the scripted login before declaring EXPIRED.
     if !valid && cfg.general.auto_relogin {
-        probe_err = match watch::auto_login(home, profile) {
+        probe_err = match watch::auto_login(home, profile, true) {
             Ok(how) => format!("re-login ok ({how})"),
             Err(e) => format!("auto re-login failed: {e:#}"),
         };
@@ -453,7 +453,7 @@ fn cmd_fetch(home: &UnnesHome, profile: &str, page_id: &str, csv: bool, json_out
     // Auto re-login: session expired -> scripted Google re-login (saved
     // profile) -> one retry, when enabled.
     if res.session_expired && cfg.general.auto_relogin {
-        if watch::auto_login(home, profile).is_ok() {
+        if watch::auto_login(home, profile, true).is_ok() {
             res = watch::fetch_page(home, profile, page)?;
         }
     }
@@ -598,7 +598,7 @@ fn cmd_data(home: &UnnesHome, _profile: &str, cmd: &DataCmd, json_out: bool) -> 
 fn cmd_kurikulum(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
     let nim = kurikulum::resolve_nim(home)
         .ok_or_else(|| app_err(1, "cannot determine NIM - set [general] nim in config or run unnes watch run first (biodata)"))?;
-    let kursus = kurikulum::fetch_and_parse(home, profile, &nim).map_err(|e| match format!("{e:#}") {
+    let kursus = kurikulum::fetch_and_parse(home, profile, &nim, true).map_err(|e| match format!("{e:#}") {
         m if m.contains("session unavailable") || m.contains("session expired") => app_err(4, format!("kurikulum: {m}")),
         m => app_err(1, format!("kurikulum: {m}")),
     })?;
@@ -648,7 +648,7 @@ fn cmd_kurikulum(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> 
 fn cmd_jadwal(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
     let nim = kurikulum::resolve_nim(home)
         .ok_or_else(|| app_err(1, "cannot determine NIM - set [general] nim in config or run unnes watch run first (biodata)"))?;
-    let (sesi, info) = jadwal::fetch_and_parse(home, profile, &nim).map_err(|e| match format!("{e:#}") {
+    let (sesi, info) = jadwal::fetch_and_parse(home, profile, &nim, true).map_err(|e| match format!("{e:#}") {
         m if m.contains("session unavailable") || m.contains("session expired") => app_err(4, format!("jadwal: {m}")),
         m => app_err(1, format!("jadwal: {m}")),
     })?;
