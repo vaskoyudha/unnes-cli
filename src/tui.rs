@@ -28,7 +28,11 @@ use crate::tugas::{self, TugasItem};
 const PANELS: [&str; 5] = ["Dashboard", "Kurikulum", "Jadwal", "Tugas", "Changelog"];
 const AUTO_REFRESH: Duration = Duration::from_secs(300);
 
-/// Everything the dashboard shows; rebuilt on each refresh.
+/// Everything the dashboard shows. Published INCREMENTALLY by the load
+/// thread (session -> kurikulum -> jadwal -> tugas -> watch), so panels
+/// appear as soon as their source completes and the screen can never stay
+/// stuck on the loading splash.
+#[derive(Clone)]
 pub struct TuiState {
     pub profile: String,
     pub session_valid: bool,
@@ -37,11 +41,14 @@ pub struct TuiState {
     pub identitas: Vec<(String, String)>,
     pub kursus: Vec<Kursus>,
     pub kurikulum_note: String,
+    pub kurikulum_loaded: bool,
     pub sesi: Vec<Sesi>,
     pub jadwal_info: JadwalInfo,
     pub jadwal_note: String,
+    pub jadwal_loaded: bool,
     pub items: Vec<TugasItem>,
     pub tugas_note: String,
+    pub tugas_loaded: bool,
     pub log: Vec<changelog::ChangelogEntry>,
     pub pages: Vec<(String, String, usize)>,
     pub refresh_note: String,
@@ -107,27 +114,74 @@ fn dbg(home: &UnnesHome, msg: &str) {
 }
 
 impl TuiState {
-    pub fn load(home: &UnnesHome, profile: &str) -> Self {
-        dbg(home, "load: mulai");
+    /// Empty shell published on the very first tick: replaces the bare
+    /// loading splash with the dashboard skeleton + a "memuat" footer.
+    pub fn skeleton(profile: &str) -> Self {
+        Self {
+            profile: profile.to_string(),
+            session_valid: false,
+            session_note: "memuat...".into(),
+            nim: String::new(),
+            identitas: Vec::new(),
+            kursus: Vec::new(),
+            kurikulum_note: String::new(),
+            kurikulum_loaded: false,
+            sesi: Vec::new(),
+            jadwal_info: JadwalInfo::default(),
+            jadwal_note: String::new(),
+            jadwal_loaded: false,
+            items: Vec::new(),
+            tugas_note: String::new(),
+            tugas_loaded: false,
+            log: Vec::new(),
+            pages: Vec::new(),
+            refresh_note: String::new(),
+        }
+    }
+
+    /// Step 1: gateway session probe + stored identity (fast).
+    pub fn probe(&mut self, home: &UnnesHome, profile: &str) {
         let (session_valid, session_note) = probe_session(home, profile);
         dbg(home, &format!("load: session valid={} note={}", session_valid, session_note));
-        let nim = kurikulum::resolve_nim(home).unwrap_or_default();
-        let identitas = biodata_rows(home);
+        self.session_valid = session_valid;
+        self.session_note = session_note;
+        self.nim = kurikulum::resolve_nim(home).unwrap_or_default();
+        self.identitas = biodata_rows(home);
+    }
 
-        let (kursus, kurikulum_note) = match kurikulum::fetch_and_parse(home, profile, &nim) {
-            Ok(k) => { dbg(home, &format!("load: kurikulum ok {} mk", k.len())); (k, String::new()) }
-            Err(e) => { dbg(home, &format!("load: kurikulum FAIL: {e:#}")); (Vec::new(), format!("{e:#}")) }
-        };
-        let (sesi, jadwal_info, jadwal_note) = match jadwal::fetch_and_parse(home, profile, &nim) {
-            Ok((s, i)) => { dbg(home, &format!("load: jadwal ok {} sesi", s.len())); (s, i, String::new()) }
-            Err(e) => { dbg(home, &format!("load: jadwal FAIL: {e:#}")); (Vec::new(), JadwalInfo::default(), format!("{e:#}")) }
-        };
-        let (items, tugas_note) = match tugas::fetch_items(home, profile) {
-            Ok(it) => { dbg(home, &format!("load: tugas ok {} item", it.len())); (it, String::new()) }
-            Err(e) => { dbg(home, &format!("load: tugas FAIL: {e:#}")); (Vec::new(), format!("{e:#}")) }
-        };
-        dbg(home, "load: selesai");
-        let log = changelog::read(home, None, None).unwrap_or_default();
+    /// Step 2: kurikulum. Non-interactive: a lapsed gateway session is
+    /// retried only with scripted logins - never a window that waits for a
+    /// click, so the dashboard can not hang on the user.
+    pub fn load_kurikulum(&mut self, home: &UnnesHome, profile: &str) {
+        match kurikulum::fetch_and_parse(home, profile, &self.nim, false) {
+            Ok(k) => { dbg(home, &format!("load: kurikulum ok {} mk", k.len())); self.kursus = k; }
+            Err(e) => { dbg(home, &format!("load: kurikulum FAIL: {e:#}")); self.kurikulum_note = format!("{e:#}"); }
+        }
+        self.kurikulum_loaded = true;
+    }
+
+    /// Step 3: jadwal (same non-interactive retry policy).
+    pub fn load_jadwal(&mut self, home: &UnnesHome, profile: &str) {
+        match jadwal::fetch_and_parse(home, profile, &self.nim, false) {
+            Ok((s, i)) => { dbg(home, &format!("load: jadwal ok {} sesi", s.len())); self.sesi = s; self.jadwal_info = i; }
+            Err(e) => { dbg(home, &format!("load: jadwal FAIL: {e:#}")); self.jadwal_note = format!("{e:#}"); }
+        }
+        self.jadwal_loaded = true;
+    }
+
+    /// Step 4: Elena task/quiz items (never blocks: per-course fetches fail
+    /// fast on a missing session).
+    pub fn load_tugas(&mut self, home: &UnnesHome, profile: &str) {
+        match tugas::fetch_items(home, profile) {
+            Ok(it) => { dbg(home, &format!("load: tugas ok {} item", it.len())); self.items = it; }
+            Err(e) => { dbg(home, &format!("load: tugas FAIL: {e:#}")); self.tugas_note = format!("{e:#}"); }
+        }
+        self.tugas_loaded = true;
+    }
+
+    /// Step 5: changelog + watch table + refresh stamp (local files only).
+    pub fn finish(&mut self, home: &UnnesHome) {
+        self.log = changelog::read(home, None, None).unwrap_or_default();
         let mut pages = Vec::new();
         if let Ok(cfg) = Config::load(home) {
             for p in &cfg.pages {
@@ -138,12 +192,9 @@ impl TuiState {
                 pages.push((p.id.clone(), at, n));
             }
         }
-        Self {
-            profile: profile.to_string(),
-            session_valid, session_note, nim, identitas, kursus, kurikulum_note,
-            sesi, jadwal_info, jadwal_note, items, tugas_note, log, pages,
-            refresh_note: format!("terakhir: {}", chrono::Local::now().format("%H:%M:%S")),
-        }
+        self.pages = pages;
+        self.refresh_note = format!("terakhir: {}", chrono::Local::now().format("%H:%M:%S"));
+        dbg(home, "load: selesai");
     }
 
     pub fn sks_lulus(&self) -> u32 { self.kursus.iter().filter(|k| k.kategori() == "LULUS").map(|k| k.sks).sum() }
@@ -197,10 +248,19 @@ fn draw(state: &TuiState, selected: usize, frame: &mut Frame) {
         _ => draw_changelog(state, frame, body),
     }
 
-    // footer
+    // footer: loading progress while sources are still coming in, then
+    // the first panel error (if any) once everything settled.
+    let mut pending: Vec<&str> = Vec::new();
+    if !state.kurikulum_loaded { pending.push("kurikulum"); }
+    if !state.jadwal_loaded { pending.push("jadwal"); }
+    if !state.tugas_loaded { pending.push("tugas"); }
     let foot = format!("[1-5/Tab] panel   [r] refresh   [q/Esc] keluar   {}", state.refresh_note);
-    let err = [&state.kurikulum_note, &state.jadwal_note, &state.tugas_note].iter().find(|s| !s.is_empty()).map(|s| s.as_str()).unwrap_or("");
-    let line = if err.is_empty() { foot } else { format!("{}   + {}", foot, err) };
+    let line = if pending.is_empty() {
+        let err = [&state.kurikulum_note, &state.jadwal_note, &state.tugas_note].iter().find(|s| !s.is_empty()).map(|s| s.as_str()).unwrap_or("");
+        if err.is_empty() { foot } else { format!("{}   + {}", foot, err) }
+    } else {
+        format!("memuat: {} ...   [q] keluar", pending.join(", "))
+    };
     frame.render_widget(Paragraph::new(line).style(Style::default().fg(Color::DarkGray)), chunks[3]);
 }
 
@@ -263,6 +323,13 @@ fn draw_dashboard(state: &TuiState, frame: &mut Frame, area: Rect) {
 }
 
 fn draw_kurikulum(state: &TuiState, frame: &mut Frame, area: Rect) {
+    if !state.kurikulum_loaded {
+        frame.render_widget(
+            Paragraph::new("memuat kurikulum dari portal... (hingga ~1-2 mnt bila sesi hangus)").block(block("Kurikulum - MEMUAT")),
+            area,
+        );
+        return;
+    }
     if state.kursus.is_empty() {
         frame.render_widget(Paragraph::new(if state.kurikulum_note.is_empty() { "belum ada data - tekan r untuk memuat" } else { state.kurikulum_note.as_str() }).block(block("Kurikulum - GAGAL AMBIL")), area);
         return;
@@ -287,6 +354,13 @@ fn draw_kurikulum(state: &TuiState, frame: &mut Frame, area: Rect) {
 }
 
 fn draw_jadwal(state: &TuiState, frame: &mut Frame, area: Rect) {
+    if !state.jadwal_loaded {
+        frame.render_widget(
+            Paragraph::new("memuat jadwal dari portal... (hingga ~1-2 mnt bila sesi hangus)").block(block("Jadwal - MEMUAT")),
+            area,
+        );
+        return;
+    }
     if state.sesi.is_empty() {
         frame.render_widget(Paragraph::new(if state.jadwal_note.is_empty() { "belum ada jadwal - tekan r untuk memuat" } else { state.jadwal_note.as_str() }).block(block("Jadwal - GAGAL AMBIL")), area);
         return;
@@ -319,6 +393,13 @@ fn hari_sekarang() -> String {
 }
 
 fn draw_tugas(state: &TuiState, frame: &mut Frame, area: Rect) {
+    if !state.tugas_loaded {
+        frame.render_widget(
+            Paragraph::new("memuat tugas Elena...").block(block("Tugas - MEMUAT")),
+            area,
+        );
+        return;
+    }
     if state.items.is_empty() {
         frame.render_widget(Paragraph::new(if state.tugas_note.is_empty() { "Belum ada tugas/kuis di Elena" } else { state.tugas_note.as_str() }).block(block("Tugas")), area);
         return;
@@ -370,16 +451,34 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
     }
     // Session/data loading happens on a background thread so the screen and
     // the keyboard stay responsive even while the portal prime takes a while.
+    // The state is published AFTER EVERY STEP (session -> kurikulum ->
+    // jadwal -> tugas -> watch), so panels appear as soon as their source
+    // finishes and a slow source (or a scripted re-login) never freezes the
+    // whole dashboard on the loading splash.
     let state: Arc<Mutex<Option<TuiState>>> = Arc::new(Mutex::new(None));
     fn start_load(home: &UnnesHome, profile: &str, target: &Arc<Mutex<Option<TuiState>>>) {
         let h = home.clone();
         let p = profile.to_string();
         let t = Arc::clone(target);
         std::thread::spawn(move || {
-            let st = TuiState::load(&h, &p);
-            if let Ok(mut g) = t.lock() {
-                *g = Some(st);
-            }
+            dbg(&h, "load: mulai");
+            let publish = |st: &TuiState| {
+                if let Ok(mut g) = t.lock() {
+                    *g = Some(st.clone());
+                }
+            };
+            let mut st = TuiState::skeleton(&p);
+            publish(&st);
+            st.probe(&h, &p);
+            publish(&st);
+            st.load_kurikulum(&h, &p);
+            publish(&st);
+            st.load_jadwal(&h, &p);
+            publish(&st);
+            st.load_tugas(&h, &p);
+            publish(&st);
+            st.finish(&h);
+            publish(&st);
         });
     }
 
