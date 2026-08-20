@@ -180,7 +180,14 @@ impl TuiState {
     }
 
     /// Step 5: changelog + watch table + refresh stamp (local files only).
-    pub fn finish(&mut self, home: &UnnesHome) {
+    /// Also re-probes the gateway: the load may have re-established the
+    /// session mid-way (scripted re-login), so the header should show VALID
+    /// instead of the expired state probed at load start.
+    pub fn finish(&mut self, home: &UnnesHome, profile: &str) {
+        let (session_valid, session_note) = probe_session(home, profile);
+        dbg(home, &format!("load: re-probe session valid={} note={}", session_valid, session_note));
+        self.session_valid = session_valid;
+        self.session_note = session_note;
         self.log = changelog::read(home, None, None).unwrap_or_default();
         let mut pages = Vec::new();
         if let Ok(cfg) = Config::load(home) {
@@ -486,7 +493,7 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
             publish(&st);
             st.load_tugas(&h, &p);
             publish(&st);
-            st.finish(&h);
+            st.finish(&h, &p);
             publish(&st);
         });
     }
