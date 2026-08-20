@@ -114,6 +114,25 @@ fn dbg(home: &UnnesHome, msg: &str) {
 }
 
 impl TuiState {
+    /// Skeleton for a refresh that KEEPS the previous data: the panels
+    /// keep showing the last good snapshot while re-fetching, so a session
+    /// lapse can never blank the dashboard "suddenly" - old data stays
+    /// visible and the footer reports the fetch progress/errors.
+    pub fn refresh_skeleton(prev: Option<Self>, profile: &str) -> Self {
+        let mut st = Self::skeleton(profile);
+        if let Some(p) = prev {
+            st.nim = p.nim;
+            st.identitas = p.identitas;
+            st.kursus = p.kursus;
+            st.sesi = p.sesi;
+            st.jadwal_info = p.jadwal_info;
+            st.items = p.items;
+            st.log = p.log;
+            st.pages = p.pages;
+        }
+        st
+    }
+
     /// Empty shell published on the very first tick: replaces the bare
     /// loading splash with the dashboard skeleton + a "memuat" footer.
     pub fn skeleton(profile: &str) -> Self {
@@ -331,19 +350,20 @@ fn draw_dashboard(state: &TuiState, frame: &mut Frame, area: Rect) {
 }
 
 fn draw_kurikulum(state: &TuiState, frame: &mut Frame, area: Rect) {
-    if !state.kurikulum_loaded {
-        let (title, body) = if state.session_valid {
-            ("Kurikulum - MEMUAT", "memuat kurikulum dari portal... (beberapa detik)")
-        } else {
-            ("Kurikulum - MENUNGGU SESI", "sesi gateway hangus - login ulang otomatis sedang berjalan (hingga ~2 mnt); atau q lalu: unnes login")
-        };
-        frame.render_widget(Paragraph::new(body).block(block(title)), area);
-        return;
-    }
     if state.kursus.is_empty() {
+        if !state.kurikulum_loaded {
+            let (title, body) = if state.session_valid {
+                ("Kurikulum - MEMUAT", "memuat kurikulum dari portal... (beberapa detik)")
+            } else {
+                ("Kurikulum - MENUNGGU SESI", "sesi gateway hangus - login ulang otomatis sedang berjalan (hingga ~2 mnt); atau q lalu: unnes login")
+            };
+            frame.render_widget(Paragraph::new(body).block(block(title)), area);
+            return;
+        }
         frame.render_widget(Paragraph::new(if state.kurikulum_note.is_empty() { "belum ada data - tekan r untuk memuat" } else { state.kurikulum_note.as_str() }).block(block("Kurikulum - GAGAL AMBIL")), area);
         return;
     }
+    // stale-but-present data stays visible during a refresh
     let rows: Vec<Row> = state.kursus.iter().map(|k| {
         Row::new(vec![
             Cell::from(k.semester.to_string()),
@@ -364,19 +384,20 @@ fn draw_kurikulum(state: &TuiState, frame: &mut Frame, area: Rect) {
 }
 
 fn draw_jadwal(state: &TuiState, frame: &mut Frame, area: Rect) {
-    if !state.jadwal_loaded {
-        let (title, body) = if state.session_valid {
-            ("Jadwal - MEMUAT", "memuat jadwal dari portal... (beberapa detik)")
-        } else {
-            ("Jadwal - MENUNGGU SESI", "sesi gateway hangus - login ulang otomatis sedang berjalan (hingga ~2 mnt); atau q lalu: unnes login")
-        };
-        frame.render_widget(Paragraph::new(body).block(block(title)), area);
-        return;
-    }
     if state.sesi.is_empty() {
+        if !state.jadwal_loaded {
+            let (title, body) = if state.session_valid {
+                ("Jadwal - MEMUAT", "memuat jadwal dari portal... (beberapa detik)")
+            } else {
+                ("Jadwal - MENUNGGU SESI", "sesi gateway hangus - login ulang otomatis sedang berjalan (hingga ~2 mnt); atau q lalu: unnes login")
+            };
+            frame.render_widget(Paragraph::new(body).block(block(title)), area);
+            return;
+        }
         frame.render_widget(Paragraph::new(if state.jadwal_note.is_empty() { "belum ada jadwal - tekan r untuk memuat" } else { state.jadwal_note.as_str() }).block(block("Jadwal - GAGAL AMBIL")), area);
         return;
     }
+    // stale-but-present data stays visible during a refresh
     let today = hari_sekarang();
     let mut rows: Vec<Row> = Vec::new();
     for s in &state.sesi {
@@ -405,19 +426,20 @@ fn hari_sekarang() -> String {
 }
 
 fn draw_tugas(state: &TuiState, frame: &mut Frame, area: Rect) {
-    if !state.tugas_loaded {
-        let (title, body) = if state.session_valid {
-            ("Tugas - MEMUAT", "memuat tugas dari Elena... (beberapa detik)")
-        } else {
-            ("Tugas - MENUNGGU SESI", "menunggu sesi Elena pulih (login ulang otomatis)...")
-        };
-        frame.render_widget(Paragraph::new(body).block(block(title)), area);
-        return;
-    }
     if state.items.is_empty() {
+        if !state.tugas_loaded {
+            let (title, body) = if state.session_valid {
+                ("Tugas - MEMUAT", "memuat tugas dari Elena... (beberapa detik)")
+            } else {
+                ("Tugas - MENUNGGU SESI", "menunggu sesi Elena pulih (login ulang otomatis)...")
+            };
+            frame.render_widget(Paragraph::new(body).block(block(title)), area);
+            return;
+        }
         frame.render_widget(Paragraph::new(if state.tugas_note.is_empty() { "Belum ada tugas/kuis di Elena" } else { state.tugas_note.as_str() }).block(block("Tugas")), area);
         return;
     }
+    // stale-but-present items stay visible during a refresh
     let rows: Vec<Row> = state.items.iter().map(|it| {
         let color = match it.flag() { "OK" => Color::Green, "BELUM" => Color::Yellow, _ => Color::White };
         Row::new(vec![
@@ -528,7 +550,7 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('r') => {
                             if let Ok(mut g) = state.lock() {
-                                *g = Some(TuiState::skeleton(profile));
+                                *g = Some(TuiState::refresh_skeleton(g.take(), profile));
                             }
                             start_load(home, profile, &state);
                             last_refresh = Instant::now();
@@ -545,7 +567,7 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
         }
         if last_refresh.elapsed() >= AUTO_REFRESH {
             if let Ok(mut g) = state.lock() {
-                *g = Some(TuiState::skeleton(profile));
+                *g = Some(TuiState::refresh_skeleton(g.take(), profile));
             }
             start_load(home, profile, &state);
             last_refresh = Instant::now();
