@@ -94,11 +94,24 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
   } catch { /* best effort */ }
 
   let launched: unknown = null;
-  try {
-    launched = await chromium.launchPersistentContext(browserDir, { headless: false });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return fail("usage", "could not launch Chromium with persistent profile: " + message + " (is another unnes login running? delete " + browserDir + " to force a fresh profile)");
+  // Persistent profiles are locked while another Chromium uses them; two
+  // unnes instances logging in at the same time must wait, not fail.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      launched = await chromium.launchPersistentContext(browserDir, { headless: false });
+      break;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const busy = /user data directory is already in use|profile in use|singleton|process singleton/i.test(message);
+      if (!busy) {
+        return fail("usage", "could not launch Chromium with persistent profile: " + message + " (is another unnes login running? delete " + browserDir + " to force a fresh profile)");
+      }
+      // another instance has the profile: wait and retry (self-serialize)
+      await new Promise((r) => setTimeout(r, 15000));
+    }
+  }
+  if (!launched) {
+    return fail("usage", "could not launch Chromium: the profile is in use by another unnes instance - close it and retry, or run: unnes login");
   }
   const ctx = launched as {
     pages(): PageLike[];
@@ -806,13 +819,23 @@ async function scriptedOAuth(jarPath: string, browserDir: string, headless: bool
   } catch { /* below */ }
   if (!chromium) return null;
   let ctx: unknown;
-  try {
-    ctx = await (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
-      .launchPersistentContext(browserDir, {
-        headless,
-        args: ["--disable-blink-features=AutomationControlled", "--disable-features=CrossOriginOpenerPolicy"],
-      });
-  } catch { return null; }
+  // Same self-serialization as browserLogin: a concurrent instance holding
+  // the profile makes us wait+retry instead of failing the login silently.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      ctx = await (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
+        .launchPersistentContext(browserDir, {
+          headless,
+          args: ["--disable-blink-features=AutomationControlled", "--disable-features=CrossOriginOpenerPolicy"],
+        });
+      break;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!/user data directory is already in use|profile in use|singleton|process singleton/i.test(message)) return null;
+      await new Promise((r) => setTimeout(r, 12000));
+    }
+  }
+  if (!ctx) return null;
   const C = ctx as {
     pages(): unknown[];
     close(): Promise<void>;
