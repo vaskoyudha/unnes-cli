@@ -15,6 +15,7 @@ mod jadwal;
 mod kurikulum;
 mod output;
 mod paths;
+mod peserta;
 mod tugas;
 mod tui;
 mod watch;

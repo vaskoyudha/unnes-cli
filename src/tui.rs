@@ -23,6 +23,7 @@ use crate::data;
 use crate::jadwal::{self, JadwalInfo, Sesi};
 use crate::kurikulum::{self, Kursus};
 use crate::paths::UnnesHome;
+use crate::peserta;
 use crate::tugas::{self, TugasItem};
 
 const PANELS: [&str; 5] = ["Dashboard", "Kurikulum", "Jadwal", "Tugas", "Changelog"];
@@ -52,6 +53,14 @@ pub struct TuiState {
     pub log: Vec<changelog::ChangelogEntry>,
     pub pages: Vec<(String, String, usize)>,
     pub refresh_note: String,
+    // class roster overlay (Jadwal tab -> Enter)
+    pub peserta_open: bool,
+    pub peserta_course: String,
+    pub peserta_cid: u32,
+    pub peserta: Vec<peserta::Peserta>,
+    pub peserta_loaded: bool,
+    pub peserta_note: String,
+    pub jadwal_sel: usize,
 }
 
 fn probe_session(home: &UnnesHome, profile: &str) -> (bool, String) {
@@ -155,6 +164,13 @@ impl TuiState {
             log: Vec::new(),
             pages: Vec::new(),
             refresh_note: String::new(),
+            peserta_open: false,
+            peserta_course: String::new(),
+            peserta_cid: 0,
+            peserta: Vec::new(),
+            peserta_loaded: false,
+            peserta_note: String::new(),
+            jadwal_sel: 0,
         }
     }
 
@@ -269,6 +285,7 @@ fn draw(state: &TuiState, selected: usize, frame: &mut Frame) {
     match selected {
         0 => draw_dashboard(state, frame, body),
         1 => draw_kurikulum(state, frame, body),
+        2 if state.peserta_open => draw_peserta(state, frame, body),
         2 => draw_jadwal(state, frame, body),
         3 => draw_tugas(state, frame, body),
         _ => draw_changelog(state, frame, body),
@@ -308,6 +325,38 @@ fn draw_dashboard(state: &TuiState, frame: &mut Frame, area: Rect) {
         info.push(Line::from(format!("Semester ke-{}", state.jadwal_info.semester)));
         info.push(Line::from(format!("IPK: {}", state.jadwal_info.ipk)));
         info.push(Line::from(format!("SKS semester ini: {}", state.jadwal_info.sks_plan)));
+    }
+    // Tugas: overdue + due-within-48h summary (red when something is late)
+    let now = chrono::Local::now().naive_local();
+    let mut overdue: Vec<&crate::tugas::TugasItem> = Vec::new();
+    let mut due_soon: Vec<&crate::tugas::TugasItem> = Vec::new();
+    for it in &state.items {
+        if it.status == "Submitted" || it.due.is_empty() {
+            continue;
+        }
+        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(&it.due, "%Y-%m-%d %H:%M") {
+            let left = d - now;
+            if left < chrono::Duration::zero() {
+                overdue.push(it);
+            } else if left <= chrono::Duration::hours(48) {
+                due_soon.push(it);
+            }
+        }
+    }
+    if !overdue.is_empty() || !due_soon.is_empty() {
+        info.push(Line::from(""));
+        if let Some(first) = overdue.first() {
+            info.push(Line::from(Span::styled(
+                format!("TERLAMBAT ({}): {} - {}", overdue.len(), first.nama, first.course),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        for it in due_soon.iter().take(2) {
+            info.push(Line::from(Span::styled(
+                format!("Due <=48 jam: {} ({})", it.nama, it.course),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
     }
     if let Some(next) = next_class_today(&state.sesi) {
         info.push(Line::from(""));
@@ -400,21 +449,74 @@ fn draw_jadwal(state: &TuiState, frame: &mut Frame, area: Rect) {
     // stale-but-present data stays visible during a refresh
     let today = hari_sekarang();
     let mut rows: Vec<Row> = Vec::new();
-    for s in &state.sesi {
+    for (idx, s) in state.sesi.iter().enumerate() {
         let is_today = s.hari == today;
+        let is_sel = idx == state.jadwal_sel;
+        let mut style = Style::default().fg(if is_today { Color::Yellow } else { Color::Reset });
+        if is_sel {
+            style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+        }
         rows.push(Row::new(vec![
             Cell::from(s.hari.as_str()),
             Cell::from(format!("{} - {}", s.mulai, s.selesai)),
             Cell::from(s.mata_kuliah.as_str()),
             Cell::from(s.ruang.as_str()),
             Cell::from(format!("{} SKS {}", s.sks, s.tipe)),
-        ]).style(Style::default().fg(if is_today { Color::Yellow } else { Color::Reset })));
+        ]).style(style));
     }
     let widths = [Constraint::Length(8), Constraint::Length(14), Constraint::Min(20), Constraint::Length(20), Constraint::Length(14)];
     frame.render_widget(
         Table::new(rows, widths)
             .header(Row::new(vec!["hari", "waktu", "mata kuliah", "ruang", "sesi"]).style(Style::default().add_modifier(Modifier::BOLD)))
-            .block(block("Jadwal Kuliah")),
+            .block(block("Jadwal Kuliah - ↑↓ pilih · Enter: peserta kelas")),
+        area,
+    );
+}
+
+/// Class roster overlay: the student list of the selected jadwal row's
+/// elena course (fetched lazily on Enter).
+fn draw_peserta(state: &TuiState, frame: &mut Frame, area: Rect) {
+    let title = if state.peserta_cid > 0 {
+        format!("Peserta - {} (elena #{})", state.peserta_course, state.peserta_cid)
+    } else {
+        format!("Peserta - {}", state.peserta_course)
+    };
+    if !state.peserta_loaded {
+        let body = if state.peserta_note.is_empty() {
+            "memuat daftar peserta dari elena..."
+        } else {
+            state.peserta_note.as_str()
+        };
+        frame.render_widget(Paragraph::new(body).block(block(&title)), area);
+        return;
+    }
+    if state.peserta.is_empty() {
+        let msg = if state.peserta_note.is_empty() {
+            "tidak ada peserta terdaftar".to_string()
+        } else {
+            state.peserta_note.clone()
+        };
+        frame.render_widget(Paragraph::new(msg).block(block(&format!("{title} - GAGAL"))), area);
+        return;
+    }
+    let rows: Vec<Row> = state
+        .peserta
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            Row::new(vec![
+                Cell::from((i + 1).to_string()),
+                Cell::from(p.nama.as_str()),
+                Cell::from(p.nim.as_str()),
+                Cell::from(p.peran.as_str()),
+            ])
+        })
+        .collect();
+    let widths = [Constraint::Length(6), Constraint::Min(30), Constraint::Length(16), Constraint::Length(12)];
+    frame.render_widget(
+        Table::new(rows, widths)
+            .header(Row::new(vec!["no", "nama", "nim", "peran"]).style(Style::default().add_modifier(Modifier::BOLD)))
+            .block(block(&format!("{title} · Esc: kembali"))),
         area,
     );
 }
@@ -526,6 +628,32 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
         });
     }
 
+    /// Background fetch of one course's participant list; publishes into the
+    /// live state so the overlay flips from "memuat" to the table.
+    fn start_peserta_load(home: &UnnesHome, profile: &str, cid: u32, target: &Arc<Mutex<Option<TuiState>>>) {
+        let h = home.clone();
+        let p = profile.to_string();
+        let t = Arc::clone(target);
+        std::thread::spawn(move || match peserta::fetch_peserta(&h, &p, cid, false) {
+            Ok(list) => {
+                if let Ok(mut g) = t.lock() {
+                    if let Some(st) = g.as_mut() {
+                        st.peserta = list;
+                        st.peserta_loaded = true;
+                    }
+                }
+            }
+            Err(e) => {
+                if let Ok(mut g) = t.lock() {
+                    if let Some(st) = g.as_mut() {
+                        st.peserta_note = format!("{e:#}");
+                        st.peserta_loaded = true;
+                    }
+                }
+            }
+        });
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -552,8 +680,20 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    let peserta_open = { state.lock().ok().and_then(|g| g.as_ref().map(|s| s.peserta_open)).unwrap_or(false) };
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            if peserta_open {
+                                // Esc closes the roster overlay first
+                                if let Ok(mut g) = state.lock() {
+                                    if let Some(st) = g.as_mut() {
+                                        st.peserta_open = false;
+                                    }
+                                }
+                            } else {
+                                break;
+                            }
+                        }
                         KeyCode::Char('r') => {
                             if let Ok(mut g) = state.lock() {
                                 *g = Some(TuiState::refresh_skeleton(g.take(), profile));
@@ -563,6 +703,56 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                         }
                         KeyCode::Tab => selected = (selected + 1) % PANELS.len(),
                         KeyCode::BackTab => selected = (selected + PANELS.len() - 1) % PANELS.len(),
+                        KeyCode::Up if selected == 2 && !peserta_open => {
+                            if let Ok(mut g) = state.lock() {
+                                if let Some(st) = g.as_mut() {
+                                    st.jadwal_sel = st.jadwal_sel.saturating_sub(1);
+                                }
+                            }
+                        }
+                        KeyCode::Down if selected == 2 && !peserta_open => {
+                            if let Ok(mut g) = state.lock() {
+                                if let Some(st) = g.as_mut() {
+                                    if st.jadwal_sel + 1 < st.sesi.len() {
+                                        st.jadwal_sel += 1;
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Enter if selected == 2 && !peserta_open => {
+                            // open the class roster of the selected jadwal row
+                            let cid = {
+                                let mut g = state.lock().unwrap();
+                                let st = g.as_mut().expect("tui state");
+                                if !st.jadwal_loaded || st.sesi.is_empty() {
+                                    None
+                                } else {
+                                    let sesi = &st.sesi[st.jadwal_sel.min(st.sesi.len() - 1)];
+                                    match peserta::find_cid_for_course(home, &sesi.mata_kuliah) {
+                                        Some(cid) => {
+                                            st.peserta_open = true;
+                                            st.peserta_course = sesi.mata_kuliah.clone();
+                                            st.peserta_cid = cid;
+                                            st.peserta.clear();
+                                            st.peserta_loaded = false;
+                                            st.peserta_note.clear();
+                                            Some(cid)
+                                        }
+                                        None => {
+                                            st.peserta_open = true;
+                                            st.peserta_course = sesi.mata_kuliah.clone();
+                                            st.peserta_note =
+                                                "tidak ada kursus Elena yang cocok untuk mata kuliah ini".into();
+                                            st.peserta_loaded = true;
+                                            None
+                                        }
+                                    }
+                                }
+                            };
+                            if let Some(cid) = cid {
+                                start_peserta_load(home, profile, cid, &state);
+                            }
+                        }
                         KeyCode::Char(c) if ('1'..='5').contains(&c) => {
                             selected = (c as usize) - ('1' as usize);
                         }
