@@ -440,18 +440,24 @@ fn draw_tugas(state: &TuiState, frame: &mut Frame, area: Rect) {
         return;
     }
     // stale-but-present items stay visible during a refresh
+    let now = chrono::Local::now().naive_local();
     let rows: Vec<Row> = state.items.iter().map(|it| {
-        let color = match it.flag() { "OK" => Color::Green, "BELUM" => Color::Yellow, _ => Color::White };
+        let base = match it.flag() { "OK" => Color::Green, "BELUM" => Color::Yellow, _ => Color::White };
+        // overdue: due date passed and nothing submitted
+        let overdue = it.status != "Submitted"
+            && chrono::NaiveDateTime::parse_from_str(&it.due, "%Y-%m-%d %H:%M")
+                .map(|d| d < now)
+                .unwrap_or(false);
         Row::new(vec![
             Cell::from(it.flag()),
             Cell::from(it.kategori.as_str()),
             Cell::from(it.course.as_str()),
             Cell::from(it.nama.as_str()),
-            Cell::from(it.due.as_str()),
+            Cell::from(if overdue { format!("{} (terlewat)", it.due) } else { it.due.clone() }),
             Cell::from(it.status.as_str()),
-        ]).style(Style::default().fg(color))
+        ]).style(Style::default().fg(if overdue { Color::Red } else { base }))
     }).collect();
-    let widths = [Constraint::Length(6), Constraint::Length(6), Constraint::Length(10), Constraint::Min(20), Constraint::Length(30), Constraint::Min(12)];
+    let widths = [Constraint::Length(6), Constraint::Length(6), Constraint::Length(16), Constraint::Min(20), Constraint::Length(34), Constraint::Min(12)];
     frame.render_widget(
         Table::new(rows, widths)
             .header(Row::new(vec!["flag", "tipe", "course", "nama", "due", "status"]).style(Style::default().add_modifier(Modifier::BOLD)))

@@ -140,7 +140,24 @@ pub fn fetch_items(home: &UnnesHome, profile: &str, interactive: bool) -> Result
                     // Moodle's activity overview table carries everything in
                     // one row: name link, due-date timestamp, submission
                     // status - one request per course, no detail crawl.
-                    for rec in &r.records {
+                    let mut recs = r.records.clone();
+                    if recs.is_empty() {
+                        // Layout without the overview table (e.g. mod/quiz):
+                        // fall back to plain activity links; due/status then
+                        // come from the per-item detail pass below.
+                        let mut fb = fetcher::job("get", profile);
+                        fb["url"] = json!(format!("https://elena.unnes.ac.id/{base}/index.php?id={cid}"));
+                        fb["extract"] = json!({
+                            "selector": format!("a[href*='{base}/view.php']"),
+                            "fields": { "nama": "a", "url": "@href" },
+                        });
+                        if let Ok(r2) = fetcher::run_job(home, profile, fb) {
+                            if r2.ok && !r2.session_expired {
+                                recs = r2.records;
+                            }
+                        }
+                    }
+                    for rec in &recs {
                         let url = rec.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
                         if !url.contains("view.php") {
                             continue;
@@ -187,6 +204,32 @@ pub fn fetch_items(home: &UnnesHome, profile: &str, interactive: bool) -> Result
             it.status = parse_status(&txt);
         }
     }
+    // Friendly course names from the stored elena-kursus crawl
+    // ("course-2018" -> "Kriptografi").
+    let mut course_names: std::collections::HashMap<u32, String> = Default::default();
+    if let Ok(Some(entry)) = data::latest(home, "elena-kursus") {
+        for r in &entry.records {
+            let src = r.get("_source").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(id) = src.split("id=").nth(1).and_then(|x| x.split(['&', '#']).next()) {
+                if let Ok(n) = id.parse::<u32>() {
+                    let title = r
+                        .get("_title")
+                        .or_else(|| r.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let short = title.split(" (").next().unwrap_or(title).trim().to_string();
+                    if !short.is_empty() {
+                        course_names.entry(n).or_insert(short);
+                    }
+                }
+            }
+        }
+    }
+    for it in items.iter_mut() {
+        if let Some(nm) = course_names.get(&it.course_id) {
+            it.course = nm.clone();
+        }
+    }
     items.sort_by(|a, b| {
         let pa = if a.status.is_empty() || a.status == "Belum dikumpulkan" || a.status == "Draft" { 0 } else { 1 };
         let pb = if b.status.is_empty() || b.status == "Belum dikumpulkan" || b.status == "Draft" { 0 } else { 1 };
@@ -205,18 +248,29 @@ fn fmt_due(ts: i64) -> String {
 }
 
 /// Map the overview table's submission-status wording to the short flags.
+/// Handles both the English and Indonesian Moodle UI wordings.
 fn normalize_status(s: &str) -> String {
     let l = s.trim().to_lowercase();
     if l.is_empty() {
         return String::new();
     }
-    if l.contains("draft") {
+    if l.contains("draft") || l.contains("draf") {
         return "Draft".into();
     }
-    if l.contains("submitted for grading") || l.contains("submitted") {
+    if l.contains("submitted for grading")
+        || l.contains("diserahkan untuk dinilai")
+        || l.contains("submitted")
+    {
         return "Submitted".into();
     }
-    if l.contains("no attempt") || l.contains("no submission") || l.contains("nothing has been submitted") || l.contains("not submitted") {
+    if l.contains("no attempt")
+        || l.contains("no submission")
+        || l.contains("nothing has been submitted")
+        || l.contains("not submitted")
+        || l.contains("belum ada submission")
+        || l.contains("belum mengumpulkan")
+        || l.contains("belum dikumpulkan")
+    {
         return "Belum dikumpulkan".into();
     }
     s.trim().to_string()
