@@ -21,6 +21,7 @@ use crate::config::{Config, Page};
 use crate::data;
 use crate::diff::{diff_lines, diff_records, DiffResult};
 use crate::fetcher::{self, JobResult};
+use crate::tugas;
 use chrono::{Datelike, Timelike};
 
 use crate::paths::UnnesHome;
@@ -278,9 +279,14 @@ fn handle_result(
 ///
 /// Render/crawl pages share ONE persistent browser session (op=batch, SSO
 /// primes deduplicated); plain pages are fetched over plain HTTP individually.
+///
+/// Watch passes are NON-INTERACTIVE: a lapsed session is retried with the
+/// scripted login only. Popping a sign-in window from a cron job or the
+/// daemon (or while the user runs the TUI) is hostile - when Google demands
+/// a click, the pass reports it and the user runs `unnes login` once.
 pub fn run_pass(home: &UnnesHome, profile: &str, only: Option<&str>) -> Result<Vec<WatchOutcome>> {
     let cfg = Config::load(home)?;
-    ensure_session(home, profile, true);
+    ensure_session(home, profile, false);
     let pages: Vec<&Page> = cfg.pages.iter().filter(|p| only.map_or(true, |id| p.id == id)).collect();
     let mut out = Vec::new();
 
@@ -318,8 +324,9 @@ pub fn run_pass(home: &UnnesHome, profile: &str, only: Option<&str>) -> Result<V
         }
     }
 
-    // Phase 2: plain pages one by one.
-    for page in pages.iter().filter(|p| !(p.render.unwrap_or(false) || p.link_selector.is_some())) {
+    // Phase 2: plain pages one by one (the tugas tracker page is handled
+    // separately in phase 3 - it has its own fetch+prime machinery).
+    for page in pages.iter().filter(|p| p.id != "tugas" && !(p.render.unwrap_or(false) || p.link_selector.is_some())) {
         let res = match fetch_page(home, profile, page) {
             Ok(r) => r,
             Err(e) => {
@@ -328,6 +335,33 @@ pub fn run_pass(home: &UnnesHome, profile: &str, only: Option<&str>) -> Result<V
             }
         };
         out.push(handle_result(home, page, res.records.clone(), res.normalized.clone(), res.session_expired, res.challenge));
+    }
+
+    // Phase 3: the tugas tracker. A config page with id "tugas" turns the
+    // assignment/quiz list into a watched dataset: new tasks land in the
+    // changelog and fire the notify hook like any other page.
+    if let Some(page) = cfg.pages.iter().find(|p| p.id == "tugas" && only.map_or(true, |id| id == "tugas")) {
+        match tugas::fetch_items(home, profile, false) {
+            Ok(items) => {
+                let records: Vec<Value> = items
+                    .iter()
+                    .map(|i| {
+                        json!({
+                            "course": i.course,
+                            "nama": i.nama,
+                            "kategori": i.kategori,
+                            "due": i.due,
+                            "status": i.status,
+                            "url": i.url,
+                        })
+                    })
+                    .collect();
+                out.push(handle_result(home, page, records, None, false, false));
+            }
+            Err(e) => {
+                out.push(WatchOutcome { page_id: page.id.clone(), changed: false, summary: format!("ERROR: {e:#}") });
+            }
+        }
     }
 
     Ok(out)
