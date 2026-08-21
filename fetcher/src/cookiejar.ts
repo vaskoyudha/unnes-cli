@@ -87,6 +87,16 @@ export class CookieJar {
     this.cookies.push(c);
   }
 
+  /** Deep snapshot of every cookie (rollback point for a request chain). */
+  snapshot(): StoredCookie[] {
+    return this.cookies.map((c) => ({ ...c }));
+  }
+
+  /** Restore a snapshot taken by snapshot(), dropping later additions. */
+  restore(snap: StoredCookie[]): void {
+    this.cookies = snap.map((c) => ({ ...c }));
+  }
+
   /** Apply Set-Cookie headers from a response to the request URL. */
   addFromSetCookie(setCookie: string[], requestUrl: URL): void {
     for (const line of setCookie) {

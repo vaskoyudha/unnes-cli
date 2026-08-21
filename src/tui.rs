@@ -191,7 +191,7 @@ impl TuiState {
     /// Step 4: Elena task/quiz items (never blocks: per-course fetches fail
     /// fast on a missing session).
     pub fn load_tugas(&mut self, home: &UnnesHome, profile: &str) {
-        match tugas::fetch_items(home, profile) {
+        match tugas::fetch_items(home, profile, false) {
             Ok(it) => { dbg(home, &format!("load: tugas ok {} item", it.len())); self.items = it; }
             Err(e) => { dbg(home, &format!("load: tugas FAIL: {e:#}")); self.tugas_note = format!("{e:#}"); }
         }

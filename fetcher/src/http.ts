@@ -50,6 +50,10 @@ export class HttpFetcher {
     let token = opts.token;
     let redirects = 0;
     const requested = url;
+    // Rollback point: a redirect chain that ends on the gateway's login page
+    // must not clobber the saved session with the anonymous cookies the
+    // login page issues (that poisoned whole sessions - see tugas/elena).
+    const jarSnap = this.jar.snapshot();
 
     for (;;) {
       const headers: Record<string, string> = {
@@ -118,7 +122,18 @@ export class HttpFetcher {
       // Some portals answer expired sessions with HTTP 200 access-denied pages
       // (duanol/Sikadu: "tidak diberi hak untuk mengakses fitur ini [tamu]!").
       const denied = /tidak diberi hak untuk mengakses|\[tamu\]|sesi (anda )?berakhir/i.test(html);
-      const sessionExpired = redirectedToLogin || res.status === 401 || denied;
+      // A data-portal request that ends up on the GATEWAY hub means the
+      // portal bounced us to the SSO login (elena/duanol do this when their
+      // own session died). The hub issues anonymous session cookies that
+      // would CLOBBER the saved gateway session - roll the jar back and
+      // report the (sub-)session as expired so callers can re-prime it.
+      const bouncedToGateway =
+        final.hostname !== requested.hostname &&
+        /(^|\.)apps\.unnes\.ac\.id$/.test(final.hostname);
+      if (bouncedToGateway) {
+        this.jar.restore(jarSnap);
+      }
+      const sessionExpired = redirectedToLogin || res.status === 401 || denied || bouncedToGateway;
       let retryAfter: number | null = null;
       const ra = res.headers.get("retry-after");
       if (ra) {
@@ -129,7 +144,7 @@ export class HttpFetcher {
         status: res.status,
         finalUrl,
         html,
-        setCookie,
+        setCookie: bouncedToGateway ? [] : setCookie,
         retryAfter,
         challenge,
         sessionExpired,

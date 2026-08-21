@@ -682,7 +682,7 @@ fn cmd_jadwal(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
 /// dates and submission status. New items appear here the moment the
 /// professor adds them (the watch crawl also logs them as changes).
 fn cmd_tugas(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
-    let items = tugas::fetch_items(home, profile).map_err(|e| match format!("{e:#}") {
+    let items = tugas::fetch_items(home, profile, true).map_err(|e| match format!("{e:#}") {
         m if m.contains("session unavailable") => app_err(4, format!("tugas: {m}")),
         m => app_err(1, format!("tugas: {m}")),
     })?;

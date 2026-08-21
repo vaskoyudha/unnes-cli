@@ -9,6 +9,7 @@ use serde_json::json;
 use crate::data;
 use crate::fetcher;
 use crate::paths::UnnesHome;
+use crate::watch;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TugasItem {
@@ -88,48 +89,70 @@ pub fn parse_status(txt: &str) -> String {
 
 /// Collect all Elena assignment/quiz items with due dates and submission
 /// status, across every stored course. Unsubmitted items sort first.
-pub fn fetch_items(home: &UnnesHome, profile: &str) -> Result<Vec<TugasItem>> {
+///
+/// Elena's Moodle session dies independently of the gateway session; when a
+/// course page bounces to the SSO login (reported as sessionExpired), the
+/// elena session is re-primed ONCE through the browser handshake
+/// (sso_app 30) and the fetch retried - exactly like kurikulum/jadwal do
+/// for duanol. `interactive` controls whether the gateway re-login may open
+/// a click-waiting window (false in the TUI).
+pub fn fetch_items(home: &UnnesHome, profile: &str, interactive: bool) -> Result<Vec<TugasItem>> {
     let kursus = course_ids(home);
     if kursus.is_empty() {
         bail!("no courses stored yet - run: unnes watch run (elena-kursus) or unnes discover --elena");
     }
     let mut items: Vec<TugasItem> = Vec::new();
+    let mut primed = false;
     let mut session_ok = true;
+    // The activities index links each task as /mod/<mod>/view.php?id=...
     for cid in &kursus {
         let name = format!("course-{cid}");
-        for (kind, path) in [("Tugas", "mod/assign/index.php"), ("Kuis", "mod/quiz/index.php")] {
+        for (kind, base) in [("Tugas", "mod/assign"), ("Kuis", "mod/quiz")] {
             let mut job = fetcher::job("get", profile);
-            job["url"] = json!(format!("https://elena.unnes.ac.id/{path}?id={cid}"));
+            job["url"] = json!(format!("https://elena.unnes.ac.id/{base}/index.php?id={cid}"));
             job["extract"] = json!({
-                "selector": format!("a[href*='{path}']"),
+                "selector": format!("a[href*='{base}/view.php']"),
                 "fields": { "nama": "a", "url": "@href" },
             });
-            let res = match fetcher::run_job(home, profile, job) {
-                Ok(r) => r,
-                Err(_) => { session_ok = false; continue; }
-            };
-            if res.session_expired || !res.ok {
-                session_ok = false;
-                continue;
+            let mut res = fetcher::run_job(home, profile, job.clone());
+            if res.as_ref().map(|r| r.session_expired || !r.ok).unwrap_or(true) && !primed {
+                // elena session dead: gateway refresh + browser handshake once
+                primed = true;
+                watch::ensure_session(home, profile, interactive);
+                let page = crate::config::Page {
+                    id: "elena-prime".into(),
+                    url: "https://elena.unnes.ac.id/my/".into(),
+                    render: Some(true),
+                    sso_app: Some("30".into()),
+                    sso_semester: Some("20261".into()),
+                    ..Default::default()
+                };
+                let _ = watch::fetch_page(home, profile, &page);
+                res = fetcher::run_job(home, profile, job);
             }
-            for r in &res.records {
-                let nama = r.get("nama").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if nama.is_empty() || url.is_empty() || nama == "Course activities" {
-                    continue;
+            match res {
+                Ok(r) if r.ok && !r.session_expired => {
+                    for r in &r.records {
+                        let nama = r.get("nama").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if nama.is_empty() || url.is_empty() || nama == "Course activities" {
+                            continue;
+                        }
+                        if !url.contains("view.php") {
+                            continue;
+                        }
+                        items.push(TugasItem {
+                            course: name.clone(),
+                            course_id: *cid,
+                            nama,
+                            url,
+                            due: String::new(),
+                            status: String::new(),
+                            kategori: kind.to_string(),
+                        });
+                    }
                 }
-                if !url.contains("view.php") {
-                    continue;
-                }
-                items.push(TugasItem {
-                    course: name.clone(),
-                    course_id: *cid,
-                    nama,
-                    url,
-                    due: String::new(),
-                    status: String::new(),
-                    kategori: kind.to_string(),
-                });
+                _ => { session_ok = false; }
             }
         }
     }
