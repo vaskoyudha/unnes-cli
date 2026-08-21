@@ -111,8 +111,13 @@ pub fn fetch_items(home: &UnnesHome, profile: &str, interactive: bool) -> Result
             let mut job = fetcher::job("get", profile);
             job["url"] = json!(format!("https://elena.unnes.ac.id/{base}/index.php?id={cid}"));
             job["extract"] = json!({
-                "selector": format!("a[href*='{base}/view.php']"),
-                "fields": { "nama": "a", "url": "@href" },
+                "selector": "tr[data-mdl-overview-cmid]",
+                "fields": {
+                    "nama": "a.activityname",
+                    "url": "a.activityname@href",
+                    "due_ts": "td[data-mdl-overview-item='duedate']@data-mdl-overview-value",
+                    "status": "td[data-mdl-overview-item='submissionstatus']",
+                },
             });
             let mut res = fetcher::run_job(home, profile, job.clone());
             if res.as_ref().map(|r| r.session_expired || !r.ok).unwrap_or(true) && !primed {
@@ -132,22 +137,25 @@ pub fn fetch_items(home: &UnnesHome, profile: &str, interactive: bool) -> Result
             }
             match res {
                 Ok(r) if r.ok && !r.session_expired => {
-                    for r in &r.records {
-                        let nama = r.get("nama").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        if nama.is_empty() || url.is_empty() || nama == "Course activities" {
-                            continue;
-                        }
+                    // Moodle's activity overview table carries everything in
+                    // one row: name link, due-date timestamp, submission
+                    // status - one request per course, no detail crawl.
+                    for rec in &r.records {
+                        let url = rec.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
                         if !url.contains("view.php") {
                             continue;
                         }
+                        let nama = rec.get("nama").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                        let due_ts = rec.get("due_ts").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                        let due = due_ts.parse::<i64>().ok().map(fmt_due).unwrap_or_default();
+                        let status = normalize_status(rec.get("status").and_then(|v| v.as_str()).unwrap_or(""));
                         items.push(TugasItem {
                             course: name.clone(),
                             course_id: *cid,
                             nama,
                             url,
-                            due: String::new(),
-                            status: String::new(),
+                            due,
+                            status,
                             kategori: kind.to_string(),
                         });
                     }
@@ -159,7 +167,12 @@ pub fn fetch_items(home: &UnnesHome, profile: &str, interactive: bool) -> Result
     if !session_ok {
         bail!("elena session unavailable; run: unnes login");
     }
+    // Fallback only: when the overview row lacked due/status, visit the
+    // item page once for the details.
     for it in items.iter_mut() {
+        if !it.due.is_empty() && !it.status.is_empty() {
+            continue;
+        }
         let mut job = fetcher::job("get", profile);
         job["url"] = json!(it.url);
         let res = match fetcher::run_job(home, profile, job) {
@@ -167,8 +180,12 @@ pub fn fetch_items(home: &UnnesHome, profile: &str, interactive: bool) -> Result
             _ => continue,
         };
         let txt = flatten(&res.normalized.unwrap_or_default());
-        it.due = parse_due(&txt);
-        it.status = parse_status(&txt);
+        if it.due.is_empty() {
+            it.due = parse_due(&txt);
+        }
+        if it.status.is_empty() {
+            it.status = parse_status(&txt);
+        }
     }
     items.sort_by(|a, b| {
         let pa = if a.status.is_empty() || a.status == "Belum dikumpulkan" || a.status == "Draft" { 0 } else { 1 };
@@ -176,6 +193,33 @@ pub fn fetch_items(home: &UnnesHome, profile: &str, interactive: bool) -> Result
         pa.cmp(&pb).then_with(|| a.due.cmp(&b.due))
     });
     Ok(items)
+}
+
+/// Unix seconds -> "YYYY-MM-DD HH:MM" in local time.
+fn fmt_due(ts: i64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_opt(ts, 0).single() {
+        Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
+        None => String::new(),
+    }
+}
+
+/// Map the overview table's submission-status wording to the short flags.
+fn normalize_status(s: &str) -> String {
+    let l = s.trim().to_lowercase();
+    if l.is_empty() {
+        return String::new();
+    }
+    if l.contains("draft") {
+        return "Draft".into();
+    }
+    if l.contains("submitted for grading") || l.contains("submitted") {
+        return "Submitted".into();
+    }
+    if l.contains("no attempt") || l.contains("no submission") || l.contains("nothing has been submitted") || l.contains("not submitted") {
+        return "Belum dikumpulkan".into();
+    }
+    s.trim().to_string()
 }
 
 #[cfg(test)]
