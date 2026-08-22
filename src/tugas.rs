@@ -97,6 +97,9 @@ pub fn parse_status(txt: &str) -> String {
 /// for duanol. `interactive` controls whether the gateway re-login may open
 /// a click-waiting window (false in the TUI).
 pub fn fetch_items(home: &UnnesHome, profile: &str, interactive: bool) -> Result<Vec<TugasItem>> {
+    if interactive {
+        refresh_stale_courses(home, profile);
+    }
     let kursus = course_ids(home);
     if kursus.is_empty() {
         bail!("no courses stored yet - run: unnes watch run (elena-kursus) or unnes discover --elena");
@@ -129,7 +132,9 @@ pub fn fetch_items(home: &UnnesHome, profile: &str, interactive: bool) -> Result
                     url: "https://elena.unnes.ac.id/my/".into(),
                     render: Some(true),
                     sso_app: Some("30".into()),
-                    sso_semester: Some("20261".into()),
+                    // semester follows the configured elena pages so a new
+                    // term only needs a config bump, not a code change
+                    sso_semester: Some(configured_elena_semester(home).unwrap_or_else(|| "20261".into())),
                     ..Default::default()
                 };
                 let _ = watch::fetch_page(home, profile, &page);
@@ -245,6 +250,35 @@ fn fmt_due(ts: i64) -> String {
         Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
         None => String::new(),
     }
+}
+
+/// The elena semester configured on any sso_app=30 page (e.g. "20261").
+fn configured_elena_semester(home: &UnnesHome) -> Option<String> {
+    let cfg = crate::config::Config::load(home).ok()?;
+    cfg.pages
+        .iter()
+        .find(|p| p.sso_app.as_deref() == Some("30"))
+        .and_then(|p| p.sso_semester.clone())
+}
+
+/// Re-crawl the elena-kursus course list when the stored one is older than
+/// seven days, so newly opened courses show up in tugas without manual
+/// `unnes watch run`. Only makes sense where a browser wait is acceptable
+/// (the CLI); the TUI keeps using the stored list to stay fast.
+fn refresh_stale_courses(home: &UnnesHome, profile: &str) {
+    const STALE_AFTER_SECS: u64 = 7 * 24 * 3600;
+    let path = data::data_file(home, "elena-kursus");
+    let age_ok = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().unwrap_or_default().as_secs() < STALE_AFTER_SECS)
+        .unwrap_or(true); // no stored crawl yet: nothing to refresh
+    if age_ok {
+        return;
+    }
+    let Ok(cfg) = crate::config::Config::load(home) else { return };
+    let Some(page) = cfg.pages.iter().find(|p| p.id == "elena-kursus") else { return };
+    watch::ensure_session(home, profile, false);
+    let _ = watch::fetch_page(home, profile, page);
 }
 
 /// Map the overview table's submission-status wording to the short flags.
