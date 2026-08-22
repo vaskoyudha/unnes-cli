@@ -98,7 +98,12 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
   // unnes instances logging in at the same time must wait, not fail.
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
-      launched = await chromium.launchPersistentContext(browserDir, { headless: false });
+      // FedCm disabled: gapi.auth2 must use the popup flow, which the
+      // scripted clicks can drive (FedCM never completes in automation).
+      launched = await chromium.launchPersistentContext(browserDir, {
+        headless: false,
+        args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
+      });
       break;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -314,8 +319,12 @@ async function launchContext(browserDir: string): Promise<unknown> {
     mkdirSync(browserDir, { recursive: true });
     chmodSync(browserDir, 0o700);
   } catch { /* best effort */ }
+  // FedCm disabled so gapi falls back to the popup flow (see above).
   return (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
-    .launchPersistentContext(browserDir, { headless: true });
+    .launchPersistentContext(browserDir, {
+      headless: true,
+      args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
+    });
 }
 
 /** Copy every *.unnes.ac.id cookie from the browser context into the jar. */
@@ -826,7 +835,7 @@ async function scriptedOAuth(jarPath: string, browserDir: string, headless: bool
       ctx = await (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
         .launchPersistentContext(browserDir, {
           headless,
-          args: ["--disable-blink-features=AutomationControlled", "--disable-features=CrossOriginOpenerPolicy"],
+          args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
         });
       break;
     } catch (err) {
@@ -910,11 +919,14 @@ async function scriptedOAuth(jarPath: string, browserDir: string, headless: bool
         try {
           const st = (await PO.evaluate(() => ({
             hasAllow: !!document.querySelector("#submit_approve_access"),
+            // current account chooser rows are div.yavlK (no data-email)
             hasEmail: !!document.querySelector("[data-email]"),
+            hasAccount: !!document.querySelector("div.yavlK"),
             url: location.href.slice(0, 120),
-          }))) as { hasAllow: boolean; hasEmail: boolean; url: string };
+          }))) as { hasAllow: boolean; hasEmail: boolean; hasAccount: boolean; url: string };
           if (st.hasAllow) { await PO.click("#submit_approve_access", { timeout: 3000 }).catch(() => {}); continue; }
           if (st.hasEmail) { await PO.click("[data-email]", { timeout: 2000 }).catch(() => {}); continue; }
+          if (st.hasAccount) { await PO.click("div.yavlK", { timeout: 2000 }).catch(() => {}); continue; }
         } catch { /* popup closed */ }
       }
     }
