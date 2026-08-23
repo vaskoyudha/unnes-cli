@@ -5,7 +5,7 @@
 //! (sso_app 30) exactly like tugas - never opening a click-waiting window.
 
 use anyhow::{bail, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::data;
@@ -13,7 +13,7 @@ use crate::fetcher;
 use crate::paths::UnnesHome;
 use crate::watch;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peserta {
     pub nama: String,
     pub nim: String,

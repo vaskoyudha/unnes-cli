@@ -17,6 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, List, ListItem, Paragraph, Row, Table, Tabs};
 use ratatui::{Frame, Terminal};
 
+use crate::cache;
 use crate::changelog;
 use crate::config::Config;
 use crate::data;
@@ -28,6 +29,13 @@ use crate::tugas::{self, TugasItem};
 
 const PANELS: [&str; 5] = ["Dashboard", "Kurikulum", "Jadwal", "Tugas", "Changelog"];
 const AUTO_REFRESH: Duration = Duration::from_secs(300);
+
+// Local cache TTLs (seconds): static dashboard data is served from disk
+// instead of re-fetching on every launch; 'r' always forces a fresh fetch.
+const CACHE_TTL_KURIKULUM: u64 = 12 * 3600; // grades change rarely
+const CACHE_TTL_JADWAL: u64 = 24 * 3600; // schedule is fixed per semester
+const CACHE_TTL_TUGAS: u64 = 3600; // assignments are dynamic
+const CACHE_TTL_PESERTA: u64 = 24 * 3600; // rosters are fixed per semester
 
 /// Everything the dashboard shows. Published INCREMENTALLY by the load
 /// thread (session -> kurikulum -> jadwal -> tugas -> watch), so panels
@@ -184,32 +192,95 @@ impl TuiState {
         self.identitas = biodata_rows(home);
     }
 
-    /// Step 2: kurikulum. Non-interactive: a lapsed gateway session is
-    /// retried only with scripted logins - never a window that waits for a
-    /// click, so the dashboard can not hang on the user.
-    pub fn load_kurikulum(&mut self, home: &UnnesHome, profile: &str) {
+    /// Step 2: kurikulum. Cache-first: a fresh cached curriculum renders
+    /// instantly with zero network; force (manual 'r') always refetches.
+    pub fn load_kurikulum(&mut self, home: &UnnesHome, profile: &str, force: bool) {
+        if !force {
+            if let Some(k) = cache::load::<Vec<Kursus>>(home, "kurikulum", CACHE_TTL_KURIKULUM) {
+                dbg(home, &format!("load: kurikulum from cache ({} mk)", k.len()));
+                self.kursus = k;
+                self.kurikulum_loaded = true;
+                return;
+            }
+        }
         match kurikulum::fetch_and_parse(home, profile, &self.nim, false) {
-            Ok(k) => { dbg(home, &format!("load: kurikulum ok {} mk", k.len())); self.kursus = k; }
-            Err(e) => { dbg(home, &format!("load: kurikulum FAIL: {e:#}")); self.kurikulum_note = format!("{e:#}"); }
+            Ok(k) => {
+                dbg(home, &format!("load: kurikulum ok {} mk", k.len()));
+                let _ = cache::save(home, "kurikulum", &k);
+                self.kursus = k;
+            }
+            Err(e) => {
+                dbg(home, &format!("load: kurikulum FAIL: {e:#}"));
+                // stale-but-present data beats a blank panel when the portal is down
+                if let Some(k) = cache::load_any::<Vec<Kursus>>(home, "kurikulum") {
+                    self.kursus = k;
+                    self.kurikulum_note = format!("cache (gagal ambil baru): {e:#}");
+                } else {
+                    self.kurikulum_note = format!("{e:#}");
+                }
+            }
         }
         self.kurikulum_loaded = true;
     }
 
-    /// Step 3: jadwal (same non-interactive retry policy).
-    pub fn load_jadwal(&mut self, home: &UnnesHome, profile: &str) {
+    /// Step 3: jadwal (same cache-first policy).
+    pub fn load_jadwal(&mut self, home: &UnnesHome, profile: &str, force: bool) {
+        if !force {
+            if let Some((s, i)) = cache::load::<(Vec<Sesi>, JadwalInfo)>(home, "jadwal", CACHE_TTL_JADWAL) {
+                dbg(home, &format!("load: jadwal from cache ({} sesi)", s.len()));
+                self.sesi = s;
+                self.jadwal_info = i;
+                self.jadwal_loaded = true;
+                return;
+            }
+        }
         match jadwal::fetch_and_parse(home, profile, &self.nim, false) {
-            Ok((s, i)) => { dbg(home, &format!("load: jadwal ok {} sesi", s.len())); self.sesi = s; self.jadwal_info = i; }
-            Err(e) => { dbg(home, &format!("load: jadwal FAIL: {e:#}")); self.jadwal_note = format!("{e:#}"); }
+            Ok((s, i)) => {
+                dbg(home, &format!("load: jadwal ok {} sesi", s.len()));
+                let _ = cache::save(home, "jadwal", &(s.clone(), i.clone()));
+                self.sesi = s;
+                self.jadwal_info = i;
+            }
+            Err(e) => {
+                dbg(home, &format!("load: jadwal FAIL: {e:#}"));
+                if let Some((s, i)) = cache::load_any::<(Vec<Sesi>, JadwalInfo)>(home, "jadwal") {
+                    self.sesi = s;
+                    self.jadwal_info = i;
+                    self.jadwal_note = format!("cache (gagal ambil baru): {e:#}");
+                } else {
+                    self.jadwal_note = format!("{e:#}");
+                }
+            }
         }
         self.jadwal_loaded = true;
     }
 
-    /// Step 4: Elena task/quiz items (never blocks: per-course fetches fail
-    /// fast on a missing session).
-    pub fn load_tugas(&mut self, home: &UnnesHome, profile: &str) {
+    /// Step 4: Elena task/quiz items (same cache-first policy; assignments
+    /// are dynamic so the TTL is short).
+    pub fn load_tugas(&mut self, home: &UnnesHome, profile: &str, force: bool) {
+        if !force {
+            if let Some(it) = cache::load::<Vec<TugasItem>>(home, "tugas", CACHE_TTL_TUGAS) {
+                dbg(home, &format!("load: tugas from cache ({} item)", it.len()));
+                self.items = it;
+                self.tugas_loaded = true;
+                return;
+            }
+        }
         match tugas::fetch_items(home, profile, false) {
-            Ok(it) => { dbg(home, &format!("load: tugas ok {} item", it.len())); self.items = it; }
-            Err(e) => { dbg(home, &format!("load: tugas FAIL: {e:#}")); self.tugas_note = format!("{e:#}"); }
+            Ok(it) => {
+                dbg(home, &format!("load: tugas ok {} item", it.len()));
+                let _ = cache::save(home, "tugas", &it);
+                self.items = it;
+            }
+            Err(e) => {
+                dbg(home, &format!("load: tugas FAIL: {e:#}"));
+                if let Some(it) = cache::load_any::<Vec<TugasItem>>(home, "tugas") {
+                    self.items = it;
+                    self.tugas_note = format!("cache (gagal ambil baru): {e:#}");
+                } else {
+                    self.tugas_note = format!("{e:#}");
+                }
+            }
         }
         self.tugas_loaded = true;
     }
@@ -602,12 +673,12 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
     // skeleton (never None), so the splash screen is unreachable: the
     // dashboard is on screen from the very first tick.
     let state: Arc<Mutex<Option<TuiState>>> = Arc::new(Mutex::new(Some(TuiState::skeleton(profile))));
-    fn start_load(home: &UnnesHome, profile: &str, target: &Arc<Mutex<Option<TuiState>>>) {
+    fn start_load(home: &UnnesHome, profile: &str, target: &Arc<Mutex<Option<TuiState>>>, force: bool) {
         let h = home.clone();
         let p = profile.to_string();
         let t = Arc::clone(target);
         std::thread::spawn(move || {
-            dbg(&h, "load: mulai");
+            dbg(&h, if force { "load: mulai (force)" } else { "load: mulai" });
             let publish = |st: &TuiState| {
                 if let Ok(mut g) = t.lock() {
                     *g = Some(st.clone());
@@ -617,11 +688,11 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
             publish(&st);
             st.probe(&h, &p);
             publish(&st);
-            st.load_kurikulum(&h, &p);
+            st.load_kurikulum(&h, &p, force);
             publish(&st);
-            st.load_jadwal(&h, &p);
+            st.load_jadwal(&h, &p, force);
             publish(&st);
-            st.load_tugas(&h, &p);
+            st.load_tugas(&h, &p, force);
             publish(&st);
             st.finish(&h, &p);
             publish(&st);
@@ -630,24 +701,38 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
 
     /// Background fetch of one course's participant list; publishes into the
     /// live state so the overlay flips from "memuat" to the table.
+    /// Cache-first: a roster seen within the last 24h renders instantly.
     fn start_peserta_load(home: &UnnesHome, profile: &str, cid: u32, target: &Arc<Mutex<Option<TuiState>>>) {
         let h = home.clone();
         let p = profile.to_string();
         let t = Arc::clone(target);
-        std::thread::spawn(move || match peserta::fetch_peserta(&h, &p, cid, false) {
-            Ok(list) => {
+        std::thread::spawn(move || {
+            let key = format!("peserta-{cid}");
+            if let Some(list) = cache::load::<Vec<peserta::Peserta>>(&h, &key, CACHE_TTL_PESERTA) {
                 if let Ok(mut g) = t.lock() {
                     if let Some(st) = g.as_mut() {
                         st.peserta = list;
                         st.peserta_loaded = true;
                     }
                 }
+                return;
             }
-            Err(e) => {
-                if let Ok(mut g) = t.lock() {
-                    if let Some(st) = g.as_mut() {
-                        st.peserta_note = format!("{e:#}");
-                        st.peserta_loaded = true;
+            match peserta::fetch_peserta(&h, &p, cid, false) {
+                Ok(list) => {
+                    let _ = cache::save(&h, &key, &list);
+                    if let Ok(mut g) = t.lock() {
+                        if let Some(st) = g.as_mut() {
+                            st.peserta = list;
+                            st.peserta_loaded = true;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut g) = t.lock() {
+                        if let Some(st) = g.as_mut() {
+                            st.peserta_note = format!("{e:#}");
+                            st.peserta_loaded = true;
+                        }
                     }
                 }
             }
@@ -666,7 +751,7 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
         return Ok(());
     }
 
-    start_load(home, profile, &state);
+    start_load(home, profile, &state, false);
     let mut selected = 0usize;
     let mut last_refresh = Instant::now();
     loop {
@@ -695,10 +780,11 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                             }
                         }
                         KeyCode::Char('r') => {
+                            // manual refresh: force a fresh fetch, bypass the cache
                             if let Ok(mut g) = state.lock() {
                                 *g = Some(TuiState::refresh_skeleton(g.take(), profile));
                             }
-                            start_load(home, profile, &state);
+                            start_load(home, profile, &state, true);
                             last_refresh = Instant::now();
                         }
                         KeyCode::Tab => selected = (selected + 1) % PANELS.len(),
@@ -765,7 +851,7 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
             if let Ok(mut g) = state.lock() {
                 *g = Some(TuiState::refresh_skeleton(g.take(), profile));
             }
-            start_load(home, profile, &state);
+            start_load(home, profile, &state, false);
             last_refresh = Instant::now();
         }
     }

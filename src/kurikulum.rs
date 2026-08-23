@@ -5,7 +5,7 @@
 //! (server-rendered; status column carries the letter grade for passed
 //! courses, "Peringatan" for the running semester, "Belum ditempuh" later).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use anyhow::{bail, Result};
 use serde_json::json;
 
@@ -14,7 +14,7 @@ use crate::fetcher;
 use crate::paths::UnnesHome;
 use crate::watch;
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Kursus {
     pub no: u32,
     pub semester: u32,

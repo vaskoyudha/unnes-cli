@@ -4,7 +4,7 @@
 //!   "Digital Center 2A - Rabu, pk. 13:00 WIB, 2 SKS Teori"
 //! concatenated; each session is parsed and laid out in a weekly view.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use anyhow::{bail, Result};
 use serde_json::json;
 
@@ -13,7 +13,7 @@ use crate::fetcher;
 use crate::paths::UnnesHome;
 use crate::watch;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sesi {
     pub mata_kuliah: String,
     pub kode: String,
@@ -28,7 +28,7 @@ pub struct Sesi {
 const HARI_URUT: [&str; 6] = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
 
 /// KRS header summary used by the dashboard: current semester, IPK, SKS plan.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct JadwalInfo {
     pub semester: u32,
     pub ipk: f64,

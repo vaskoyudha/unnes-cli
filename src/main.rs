@@ -6,6 +6,7 @@
 // silence the interim dead-code noise that would otherwise spam every build.
 #![allow(dead_code)]
 
+mod cache;
 mod changelog;
 mod config;
 mod data;
