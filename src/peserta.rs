@@ -80,7 +80,10 @@ pub fn find_cid_for_course(home: &UnnesHome, course_name: &str) -> Option<u32> {
 
 fn participant_job(_home: &UnnesHome, profile: &str, cid: u32) -> serde_json::Value {
     let mut job = fetcher::job("get", profile);
-    job["url"] = json!(format!("https://elena.unnes.ac.id/user/index.php?id={cid}"));
+    // perpage=0 disables Moodle's 20-rows-per-page pagination: without it the
+    // roster silently truncates to the first page (only 20 of 48 students).
+    // Moodle treats 0 as "show all" on user/index.php (verified live).
+    job["url"] = json!(format!("https://elena.unnes.ac.id/user/index.php?id={cid}&perpage=0"));
     job["extract"] = json!({
         "selector": "#participants tbody tr",
         "fields": {
@@ -135,4 +138,42 @@ pub fn fetch_peserta(home: &UnnesHome, profile: &str, cid: u32, interactive: boo
     }
     out.sort_by(|a, b| b.peran.cmp(&a.peran).then(a.nama.to_lowercase().cmp(&b.nama.to_lowercase())));
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live-network verification (needs a valid elena session in ~/.config/unnes):
+    /// the full fetch must return the whole class, not just the first 20.
+    #[test]
+    #[ignore = "live network; run explicitly with --ignored"]
+    fn fetch_peserta_returns_full_roster_live() {
+        let home = UnnesHome { root: std::path::PathBuf::from(
+            std::env::var("HOME").unwrap() + "/.config/unnes",
+        ) };
+        let list = fetch_peserta(&home, "default", 4514, false).unwrap();
+        assert!(
+            list.len() >= 40,
+            "expected the full class (>40), got only {} - pagination regression?",
+            list.len()
+        );
+        // every entry must carry a parsed name (no empty rows leaked through)
+        assert!(list.iter().all(|p| !p.nama.is_empty()));
+    }
+
+    #[test]
+    fn participant_job_disables_moodle_pagination() {
+        // Regression: user/index.php paginates at 20 rows/page by default, so
+        // without perpage=0 a 48-student class silently shows only 20. The job
+        // URL must carry perpage=0 ("show all") to fetch the full roster.
+        let home = UnnesHome { root: std::path::PathBuf::from("/tmp/unnes-test") };
+        let job = participant_job(&home, "default", 4514);
+        let url = job["url"].as_str().unwrap();
+        assert!(
+            url.contains("id=4514&perpage=0"),
+            "participant URL must request all rows in one page, got: {url}"
+        );
+        assert_eq!(job["extract"]["selector"], "#participants tbody tr");
+    }
 }
