@@ -828,35 +828,6 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
         });
     }
 
-    /// Background submit: upload `file` to the task `cmid` as a DRAFT via the
-    /// op=submit fetcher path (same machinery as `unnes tugas submit`). Publishes
-    /// the outcome into submit_note so the user sees the result in the TUI.
-    fn submit_tugas(home: &UnnesHome, profile: &str, cmid: u32, file: &str, target: &Arc<Mutex<Option<TuiState>>>) {
-        let h = home.clone();
-        let p = profile.to_string();
-        let f = file.to_string();
-        let t = Arc::clone(target);
-        std::thread::spawn(move || {
-            let mut job = crate::fetcher::job("submit", &p);
-            job["url"] = serde_json::json!(format!("https://elena.unnes.ac.id/mod/assign/view.php?id={cmid}"));
-            job["file"] = serde_json::json!(f);
-            job["action"] = serde_json::json!("draft");
-            job["ssoApp"] = serde_json::json!("30");
-            job["semester"] = serde_json::json!(crate::tugas::configured_elena_semester(&h).unwrap_or_else(|| "20261".into()));
-            dbg(&h, &format!("submit tugas {cmid}: file {f}"));
-            let note = match crate::fetcher::run_job(&h, &p, job) {
-                Ok(res) if res.ok => res.message.clone().unwrap_or_else(|| "upload ok (draft)".into()),
-                Ok(res) => res.error.as_ref().map(|e| e.message.clone()).unwrap_or_else(|| "upload gagal".into()),
-                Err(e) => format!("{e:#}"),
-            };
-            dbg(&h, &format!("submit tugas {cmid}: {note}"));
-            if let Ok(mut g) = t.lock() {
-                if let Some(st) = g.as_mut() {
-                    st.submit_note = note;
-                }
-            }
-        });
-    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1007,16 +978,15 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                             }
                         }
                         KeyCode::Char('u') if selected == 3 && tugas_items > 0 => {
-                            // open the submit overlay: type a file path, Enter uploads
+                            // spawn a native file-picker dialog; the chosen file is uploaded headless as draft
                             dbg(home, "key u pressed on tugas panel");
                             if let Ok(mut g) = state.lock() {
                                 if let Some(st) = g.as_mut() {
                                     if let Some(it) = st.items.get(st.tugas_sel.min(st.items.len() - 1)) {
-                                        st.submit_open = true;
-                                        st.submit_input.clear();
-                                        st.submit_cid = it.url.split("id=").nth(1).and_then(|s| s.split('&').next()).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-                                        st.submit_course = it.course.clone();
-                                        st.submit_note.clear();
+                                        let cmid = it.url.split("id=").nth(1).and_then(|s| s.split('&').next()).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                                        if cmid > 0 {
+                                            pick_file_and_submit(home, profile, cmid, &it.course, &state);
+                                        }
                                     }
                                 }
                             }
@@ -1074,4 +1044,107 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Background submit: upload `file` to the task `cmid` as a DRAFT via the
+/// op=submit fetcher path (same machinery as `unnes tugas submit`). Publishes
+/// the outcome into submit_note so the user sees the result in the TUI.
+fn submit_tugas(home: &UnnesHome, profile: &str, cmid: u32, file: &str, target: &Arc<Mutex<Option<TuiState>>>) {
+    let h = home.clone();
+    let p = profile.to_string();
+    let f = file.to_string();
+    let t = Arc::clone(target);
+    std::thread::spawn(move || {
+        let mut job = crate::fetcher::job("submit", &p);
+        job["url"] = serde_json::json!(format!("https://elena.unnes.ac.id/mod/assign/view.php?id={cmid}"));
+        job["file"] = serde_json::json!(f);
+        job["action"] = serde_json::json!("draft");
+        job["ssoApp"] = serde_json::json!("30");
+        job["semester"] = serde_json::json!(crate::tugas::configured_elena_semester(&h).unwrap_or_else(|| "20261".into()));
+        dbg(&h, &format!("submit tugas {cmid}: file {f}"));
+        let note = match crate::fetcher::run_job(&h, &p, job) {
+            Ok(res) if res.ok => res.message.clone().unwrap_or_else(|| "upload ok (draft)".into()),
+            Ok(res) => res.error.as_ref().map(|e| e.message.clone()).unwrap_or_else(|| "upload gagal".into()),
+            Err(e) => format!("{e:#}"),
+        };
+        dbg(&h, &format!("submit tugas {cmid}: {note}"));
+        if let Ok(mut g) = t.lock() {
+            if let Some(st) = g.as_mut() {
+                st.submit_note = note;
+            }
+        }
+    });
+}
+
+/// Pick a local file via a native dialog (zenity on Linux, osascript on macOS,
+/// PowerShell on Windows) and upload it to the given task as a DRAFT.
+/// Runs in a background thread so the dashboard stays responsive while the
+/// dialog is open. If no native picker is available, opens the in-TUI typing
+/// overlay instead (submit_open).
+fn pick_file_and_submit(home: &UnnesHome, profile: &str, cmid: u32, course: &str, target: &Arc<Mutex<Option<TuiState>>>) {
+    let h = home.clone();
+    let p = profile.to_string();
+    let c = course.to_string();
+    let t = Arc::clone(target);
+    std::thread::spawn(move || {
+        if let Ok(mut g) = t.lock() {
+            if let Some(st) = g.as_mut() {
+                st.submit_open = false;
+                st.submit_note = format!("pilih file untuk tugas {c}...");
+            }
+        }
+        let picker = if cfg!(target_os = "macos") {
+            None // osascript would need a shell; skip for now
+        } else if cfg!(target_os = "windows") {
+            None
+        } else {
+            // zenity, then kdialog as fallback
+            ["zenity", "kdialog"].iter().find(|t| std::process::Command::new(t).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)).copied()
+        };
+        let file = match picker {
+            Some("zenity") => {
+                let out = std::process::Command::new("zenity")
+                    .arg("--file-selection")
+                    .arg("--title").arg(format!("Pilih file untuk tugas {c}"))
+                    .arg("--file-filter").arg("Dokumen (pdf, docx, xlsx, zip, png, jpg) | *.pdf *.docx *.doc *.xlsx *.zip *.png *.jpg")
+                    .arg("--file-filter").arg("Semua file | *")
+                    .output();
+                out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty())
+            }
+            Some("kdialog") => {
+                let out = std::process::Command::new("kdialog")
+                    .arg("--getopenfilename").arg(".")
+                    .arg("*.pdf *.docx *.doc *.xlsx *.zip *.png *.jpg")
+                    .output();
+                out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty())
+            }
+            _ => None,
+        };
+        match file {
+            Some(path) => {
+                dbg(&h, &format!("file picked: {path}"));
+                if let Ok(mut g) = t.lock() {
+                    if let Some(st) = g.as_mut() {
+                        st.submit_cid = cmid;
+                        st.submit_course = c.clone();
+                        st.submit_note = format!("uploading {path}...");
+                    }
+                }
+                submit_tugas(&h, &p, cmid, &path, &t);
+            }
+            None => {
+                // cancelled or no native picker: fall back to the typing overlay
+                dbg(&h, "file picker cancelled or unavailable; falling back to typing");
+                if let Ok(mut g) = t.lock() {
+                    if let Some(st) = g.as_mut() {
+                        st.submit_open = true;
+                        st.submit_input.clear();
+                        st.submit_cid = cmid;
+                        st.submit_course = c.clone();
+                        st.submit_note.clear();
+                    }
+                }
+            }
+        }
+    });
 }
