@@ -253,7 +253,7 @@ fn fmt_due(ts: i64) -> String {
 }
 
 /// The elena semester configured on any sso_app=30 page (e.g. "20261").
-fn configured_elena_semester(home: &UnnesHome) -> Option<String> {
+pub fn configured_elena_semester(home: &UnnesHome) -> Option<String> {
     let cfg = crate::config::Config::load(home).ok()?;
     cfg.pages
         .iter()

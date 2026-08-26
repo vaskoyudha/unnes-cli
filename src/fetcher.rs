@@ -117,6 +117,8 @@ pub struct JobResult {
     pub landing_url: Option<String>,
     pub captured_cookies: Option<u64>,
     pub mode: Option<String>,
+    /// op=submit: human-readable outcome
+    pub message: Option<String>,
     pub error: Option<JobError>,
 }
 

@@ -58,6 +58,8 @@ pub struct TuiState {
     pub items: Vec<TugasItem>,
     pub tugas_note: String,
     pub tugas_loaded: bool,
+    /// selected row in the Tugas panel (Enter opens the task URL)
+    pub tugas_sel: usize,
     pub log: Vec<changelog::ChangelogEntry>,
     pub pages: Vec<(String, String, usize)>,
     pub refresh_note: String,
@@ -169,6 +171,7 @@ impl TuiState {
             items: Vec::new(),
             tugas_note: String::new(),
             tugas_loaded: false,
+            tugas_sel: 0,
             log: Vec::new(),
             pages: Vec::new(),
             refresh_note: String::new(),
@@ -614,13 +617,18 @@ fn draw_tugas(state: &TuiState, frame: &mut Frame, area: Rect) {
     }
     // stale-but-present items stay visible during a refresh
     let now = chrono::Local::now().naive_local();
-    let rows: Vec<Row> = state.items.iter().map(|it| {
+    let rows: Vec<Row> = state.items.iter().enumerate().map(|(i, it)| {
         let base = match it.flag() { "OK" => Color::Green, "BELUM" => Color::Yellow, _ => Color::White };
         // overdue: due date passed and nothing submitted
         let overdue = it.status != "Submitted"
             && chrono::NaiveDateTime::parse_from_str(&it.due, "%Y-%m-%d %H:%M")
                 .map(|d| d < now)
                 .unwrap_or(false);
+        let is_sel = i == state.tugas_sel;
+        let mut style = Style::default().fg(if overdue { Color::Red } else { base });
+        if is_sel {
+            style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+        }
         Row::new(vec![
             Cell::from(it.flag()),
             Cell::from(it.kategori.as_str()),
@@ -628,13 +636,13 @@ fn draw_tugas(state: &TuiState, frame: &mut Frame, area: Rect) {
             Cell::from(it.nama.as_str()),
             Cell::from(if overdue { format!("{} (terlewat)", it.due) } else { it.due.clone() }),
             Cell::from(it.status.as_str()),
-        ]).style(Style::default().fg(if overdue { Color::Red } else { base }))
+        ]).style(style)
     }).collect();
     let widths = [Constraint::Length(6), Constraint::Length(6), Constraint::Length(16), Constraint::Min(20), Constraint::Length(34), Constraint::Min(12)];
     frame.render_widget(
         Table::new(rows, widths)
             .header(Row::new(vec!["flag", "tipe", "course", "nama", "due", "status"]).style(Style::default().add_modifier(Modifier::BOLD)))
-            .block(block("Tugas & Kuis Elena")),
+            .block(block("Tugas & Kuis Elena - ↑↓ pilih · Enter: buka di browser")),
         area,
     );
 }
@@ -644,7 +652,24 @@ fn draw_changelog(state: &TuiState, frame: &mut Frame, area: Rect) {
         ListItem::new(Line::from(format!("{}  {:<14} {}", &e.at[..11.min(e.at.len())], e.page_id, e.summary())))
     }).collect();
     frame.render_widget(List::new(items).block(block("Changelog")), area);
-}// ---------------------------------------------------------------------------
+}
+
+/// Open a URL in the default browser (xdg-open on Linux, open on macOS,
+/// start on Windows). Best-effort: a missing launcher is ignored.
+fn open_in_browser(url: &str) {
+    let launcher = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "cmd"
+    } else {
+        "xdg-open"
+    };
+    match std::process::Command::new(launcher).arg(url).spawn() {
+        Ok(mut child) => { let _ = child.wait(); }
+        Err(_) => eprintln!("tidak bisa membuka browser: tidak ada {launcher}"),
+    }
+}
+// ---------------------------------------------------------------------------
 // Event loop
 // ---------------------------------------------------------------------------
 
@@ -766,6 +791,7 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     let peserta_open = { state.lock().ok().and_then(|g| g.as_ref().map(|s| s.peserta_open)).unwrap_or(false) };
+                    let tugas_items = { state.lock().ok().and_then(|g| g.as_ref().map(|s| s.items.len())).unwrap_or(0) };
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
                             if peserta_open {
@@ -803,6 +829,35 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                                         st.jadwal_sel += 1;
                                     }
                                 }
+                            }
+                        }
+                        KeyCode::Up if selected == 3 && tugas_items > 0 => {
+                            if let Ok(mut g) = state.lock() {
+                                if let Some(st) = g.as_mut() {
+                                    st.tugas_sel = st.tugas_sel.saturating_sub(1);
+                                }
+                            }
+                        }
+                        KeyCode::Down if selected == 3 && tugas_items > 0 => {
+                            if let Ok(mut g) = state.lock() {
+                                if let Some(st) = g.as_mut() {
+                                    if st.tugas_sel + 1 < st.items.len() {
+                                        st.tugas_sel += 1;
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Enter if selected == 3 && tugas_items > 0 => {
+                            // open the selected task's URL in the default browser
+                            let url = {
+                                let g = state.lock().unwrap();
+                                let st = g.as_ref().expect("tui state");
+                                st.items
+                                    .get(st.tugas_sel.min(st.items.len() - 1))
+                                    .map(|it| it.url.clone())
+                            };
+                            if let Some(url) = url {
+                                open_in_browser(&url);
                             }
                         }
                         KeyCode::Enter if selected == 2 && !peserta_open => {

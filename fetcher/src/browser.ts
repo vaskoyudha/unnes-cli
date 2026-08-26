@@ -992,3 +992,202 @@ async function waitForPopup(ctx: unknown, timeoutMs: number): Promise<unknown | 
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// op: submit - upload a file to an Elena (Moodle) assignment and optionally
+// finalize the submission. The submission form is JS-rendered, so this runs in
+// the persistent browser session (same SSO priming as op=page) and drives the
+// filepicker with Playwright. Steps are logged (not returned) so failures are
+// debuggable from stderr; the result reports the final status text.
+// ---------------------------------------------------------------------------
+
+export interface SubmitOpts {
+  url: string;
+  /** absolute path to the local file to upload */
+  file: string;
+  /** "draft" = Save changes only; "submit" = final Submit assignment */
+  action: "draft" | "submit";
+  ssoApp?: string;
+  semester?: string;
+  hubUrl?: string;
+  waitMs?: number;
+}
+
+export interface SubmitResult {
+  contract: number;
+  ok: boolean;
+  op: "submit";
+  finalUrl: string | null;
+  sessionExpired: boolean;
+  message: string;
+  error?: { code: string; message: string };
+  [k: string]: unknown;
+}
+
+export async function submitAssignment(jarPath: string, browserDir: string, opts: SubmitOpts): Promise<SubmitResult> {
+  const base = {
+    contract: 1, ok: false as boolean, op: "submit" as const,
+    finalUrl: null as string | null, sessionExpired: false, message: ""
+  };
+  const log = (m: string) => console.error("[submit] " + m);
+  if (process.env.UNNES_NO_BROWSER) {
+    return { ...base, error: { code: "usage", message: "submit disabled via UNNES_NO_BROWSER" } };
+  }
+  let ctx: unknown;
+  try {
+    ctx = await launchContext(browserDir);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ...base, error: { code: "usage", message } };
+  }
+  const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
+  const P = page as {
+    goto(u: string, o?: unknown): Promise<unknown>;
+    url(): Promise<string>;
+    content(): Promise<string>;
+    click(s: string, o?: unknown): Promise<void>;
+    waitForSelector(s: string, o?: unknown): Promise<unknown>;
+    setInputFiles(s: string, f: string, o?: unknown): Promise<void>;
+    evaluate(fn: string | ((...a: any[]) => unknown), arg?: unknown): Promise<unknown>;
+    waitForTimeout(ms: number): Promise<void>;
+  };
+  try {
+    // 1. prime the gateway app session (same as renderPage/crawl)
+    const hub = opts.hubUrl ?? "https://apps.unnes.ac.id";
+    if (opts.ssoApp) {
+      await P.goto(hub + "/" + opts.ssoApp, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await new Promise((r) => setTimeout(r, 6000));
+      let u = "";
+      try { u = await P.url(); } catch { /* closed */ }
+      if (/\/(auth\/)?login/i.test(u)) {
+        return { ...base, sessionExpired: true, error: { code: "session", message: "gateway session expired; run: unnes login" } };
+      }
+    }
+    if (opts.ssoApp === "30") {
+      await completeElenaSession(page as never, opts.semester ?? "20261");
+    }
+
+    // 2. open the assignment page
+    await P.goto(opts.url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await P.waitForTimeout(3000);
+    const finalUrl = await P.url();
+    log("opened " + finalUrl);
+
+    // 3. session health
+    const html0 = await P.content();
+    const body0 = html0.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 400);
+    const landedOnGateway = finalUrl.startsWith("https://apps.unnes.ac.id");
+    if ((landedOnGateway && LOGIN_MARKERS.test(body0)) || /\/auth\/login/i.test(finalUrl) || MOODLE_LOGIN_MARKERS.test(body0)) {
+      return { ...base, sessionExpired: true, finalUrl, error: { code: "session", message: "session expired; run: unnes login" } };
+    }
+
+    // 4. already-submitted guard: never touch a finalized submission
+    const state1 = (await P.evaluate(() => ({
+      alreadySubmitted: /submitted for grading|diserahkan untuk dinilai/i.test(document.body.innerText),
+      inForm: /action=(addsubmission|editsubmission)/i.test(location.href),
+      addSubText: [...document.querySelectorAll("button, input[type=submit], a")].map(e => { const x = e as HTMLElement & HTMLInputElement; return (x.innerText || x.value || "").trim(); }).filter(t => /add submission|tambah pengumpulan/i.test(t)).slice(0, 3),
+    }))) as { alreadySubmitted: boolean; inForm: boolean; addSubText: string[] };
+    log("state1: " + JSON.stringify(state1));
+    if (state1.alreadySubmitted) {
+      const msg = "assignment is already submitted; edit/resubmit is not supported - nothing to upload";
+      log(msg);
+      return { ...base, ok: true, finalUrl, message: msg };
+    }
+
+    // 5. open the submission form: click "Add submission" (a submit button
+    //    with that label; the current Moodle render is a <button type=submit>).
+    if (!state1.inForm) {
+      const clicked = await P.evaluate(() => {
+        const btn = [...document.querySelectorAll("button, input[type=submit], a")].find(e => { const x = e as HTMLElement & HTMLInputElement; return /add submission|tambah pengumpulan/i.test((x.innerText || x.value || "").trim()); });
+        if (!btn) return false;
+        (btn as HTMLElement).click();
+        return true;
+      });
+      if (clicked) {
+        await P.waitForTimeout(4000);
+        log("clicked Add submission");
+      } else {
+        // form may already be expanded without the URL changing
+        log("no Add submission button - form may be open already");
+      }
+    }
+
+    // 6. open the filepicker dialog via its toolbar Add button
+    let fileInputs = (await P.evaluate(() => document.querySelectorAll('input[type="file"]').length)) as number;
+    if (fileInputs === 0) {
+      const opened = await P.evaluate(() => {
+        const btn = document.querySelector(".fp-btn-add a[role=button], .fp-btn-add a, .fp-btn a[role=button], a[title='Add...']");
+        if (!btn) return false;
+        (btn as HTMLElement).click();
+        return true;
+      });
+      await P.waitForTimeout(3000);
+      log("filepicker opened: " + opened);
+      fileInputs = (await P.evaluate(() => document.querySelectorAll('input[type="file"]').length)) as number;
+      log("file inputs after open: " + fileInputs);
+    }
+
+    // 7. attach the file
+    const fileExists = await import("node:fs").then((m) => m.existsSync(opts.file));
+    if (!fileExists) {
+      return { ...base, finalUrl, error: { code: "usage", message: "file not found: " + opts.file } };
+    }
+    let uploaded = false;
+    for (const sel of ['input[type="file"]', "#repo_upload_file", "#fileupload_form input[type=file]", "input[name='repo_upload_file']"]) {
+      try {
+        await P.setInputFiles(sel, opts.file, { timeout: 8000 });
+        uploaded = true;
+        log("set file on " + sel + " (" + opts.file + ")");
+        break;
+      } catch { /* selector not present */ }
+    }
+    if (!uploaded) {
+      const msg = "could not attach the file to any file input; run with UNNES_VERBOSE=1 for the DOM state";
+      log(msg);
+      return { ...base, finalUrl, error: { code: "usage", message: msg } };
+    }
+    await P.waitForTimeout(2000);
+
+    // 8. confirm the file is staged, then save/submit
+    const staged = (await P.evaluate(() => { const m = document.body.innerText.match(/[^\n]*\.pdf|[^\n]*\.docx?|[^\n]*\.xlsx?|[^\n]*\.zip|[^\n]*\.png|[^\n]*\.jpg/g); return m ? m.slice(-1)[0] : ""; })) as string;
+    log("staged file text: " + staged);
+
+    // upload button in the picker dialog ("Upload this file")
+    try {
+      await P.click("#fileuploadbutton, .fp-upload-btn, button[data-action='upload'], input[value='Upload this file'], input[value='Upload']", { timeout: 5000 });
+      await P.waitForTimeout(3000);
+      log("clicked upload");
+    } catch { /* file may attach without a separate upload step */ }
+
+    const finalizeSel = opts.action === "submit"
+      ? "input[name='submitbutton'], button[name='submitbutton'], button[data-action='submit'], input[value='Submit assignment']"
+      : "input[name='saveandreturn'], button[name='saveandreturn'], input[name='saveandnext'], button[data-action='save-submission'], input[value='Save changes']";
+    try {
+      await P.click(finalizeSel, { timeout: 8000 });
+      await P.waitForTimeout(4000);
+      log("clicked " + (opts.action === "submit" ? "Submit assignment" : "Save changes"));
+    } catch (err) {
+      const msg = "file attached but the " + (opts.action === "submit" ? "Submit" : "Save") + " button was not found; the upload may still have been staged as a draft";
+      log(msg);
+      return { ...base, ok: true, finalUrl, message: msg };
+    }
+
+    // 9. report the resulting status
+    const finalHtml = await P.content();
+    const finalBody = finalHtml.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
+    const submitted = /submitted for grading|diserahkan untuk dinilai/i.test(finalBody);
+    const status = (finalBody.match(/(?:Submission status|Status pengumpulan)[^.]{0,60}/i) || [""])[0].trim();
+    const message = (opts.action === "submit" && submitted)
+      ? "submitted for grading: " + status
+      : "file uploaded and saved as draft";
+    const jar = await CookieJar.load(jarPath);
+    const captured = await syncJarFromContext(ctx, jar);
+    await jar.save(jarPath);
+    return { ...base, ok: true, finalUrl: await P.url(), message, capturedCookies: captured };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ...base, error: { code: "internal", message: "submit failed: " + message } };
+  } finally {
+    try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
+  }
+}

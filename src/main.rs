@@ -80,7 +80,7 @@ enum Cmd {
     /// Jadwal kuliah: weekly class schedule (Senin..Sabtu)
     Jadwal,
     /// Tugas: Elena assignments/quizzes with deadlines and submission status
-    Tugas,
+    Tugas(TugasArgs),
     /// TUI: interactive dashboard (ratatui)
     Tui,
     /// Print the change log.
@@ -224,6 +224,27 @@ struct ChangelogArgs {
     page_id: Option<String>,
 }
 
+#[derive(Args)]
+struct TugasArgs {
+    #[command(subcommand)]
+    cmd: Option<TugasCmd>,
+}
+
+#[derive(Subcommand)]
+enum TugasCmd {
+    /// Upload a file to an Elena assignment (mod/assign/view.php?id=<cmid>)
+    Submit {
+        /// Course module id from the task URL (e.g. 11226)
+        cmid: u32,
+        /// Path to the local file to upload
+        #[arg(long)]
+        file: String,
+        /// Finalize the submission (Submit assignment) instead of saving a draft
+        #[arg(long)]
+        submit: bool,
+    },
+}
+
 /// Error carrying the CLI exit code (spec: 0 ok, 1 generic, 2 usage,
 /// 3 not logged in, 4 session expired, 5 network/429, 6 selector outdated).
 #[derive(Debug)]
@@ -290,7 +311,10 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Data(d) => cmd_data(&home, &profile, &d.cmd, cli.json),
         Cmd::Kurikulum => cmd_kurikulum(&home, &profile, cli.json),
         Cmd::Jadwal => cmd_jadwal(&home, &profile, cli.json),
-        Cmd::Tugas => cmd_tugas(&home, &profile, cli.json),
+        Cmd::Tugas(a) => match a.cmd {
+            None => cmd_tugas(&home, &profile, cli.json),
+            Some(TugasCmd::Submit { cmid, file, submit }) => cmd_tugas_submit(&home, &profile, cmid, &file, submit, cli.json),
+        },
         Cmd::Tui => tui::run(&home, &profile),
         Cmd::Changelog(a) => changelog_list(&home, &a, cli.json),
     }
@@ -871,5 +895,42 @@ fn changelog_list(home: &UnnesHome, args: &ChangelogArgs, json: bool) -> Result<
         })
         .collect();
     println!("{}", output::records_table(&records));
+    Ok(())
+}
+
+/// unnes tugas submit <cmid> --file=<path> [--submit]
+/// Upload a file to an Elena assignment (mod/assign/view.php?id=<cmid>).
+/// Default saves a draft; --submit finalizes the submission.
+fn cmd_tugas_submit(home: &UnnesHome, profile: &str, cmid: u32, file: &str, finalize: bool, json_out: bool) -> Result<()> {
+    if !home.profile_jar_file(profile).is_file() {
+        return Err(app_err(3, format!("not logged in (profile {profile}); run: unnes login")));
+    }
+    let path = std::path::Path::new(file);
+    if !path.is_file() {
+        return Err(app_err(1, format!("file not found: {file}")));
+    }
+    let mut job = fetcher::job("submit", profile);
+    job["url"] = json!(format!("https://elena.unnes.ac.id/mod/assign/view.php?id={cmid}"));
+    job["file"] = json!(file);
+    job["action"] = json!(if finalize { "submit" } else { "draft" });
+    job["ssoApp"] = json!("30");
+    job["semester"] = json!(tugas::configured_elena_semester(home).unwrap_or_else(|| "20261".into()));
+    let res = fetcher::run_job(home, profile, job)?;
+    if !res.ok {
+        let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
+        return Err(app_err(err_code_for(&code), format!("submit: {}", err_msg(&res))));
+    }
+    let message = res.message.clone().unwrap_or_else(|| "ok".into());
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "cmid": cmid,
+            "file": file,
+            "action": if finalize { "submit" } else { "draft" },
+            "message": message,
+        }))?);
+    } else {
+        println!("tugas {cmid}: {message}");
+    }
     Ok(())
 }

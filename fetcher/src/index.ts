@@ -8,7 +8,7 @@ import { ExtractSpec, extractRecords } from "./extract.js";
 
 export interface Job {
   contract: number;
-  op: "get" | "login" | "logout" | "sso" | "page" | "crawl" | "batch";
+  op: "get" | "login" | "logout" | "sso" | "page" | "crawl" | "batch" | "submit";
   profile?: string;
   /** used by login/logout when the job URL family is not explicit */
   baseUrl?: string;
@@ -35,6 +35,10 @@ export interface Job {
   preUrl?: string;
   /** op=page/crawl (elena): semester to open after SSO, default 20261 */
   semester?: string;
+  /** op=submit: file to upload to an Elena assignment (absolute path) */
+  file?: string;
+  /** op=submit: "draft" (default) or "submit" (finalize) */
+  action?: "draft" | "submit";
   /** op=batch: entries to render in one shared browser session */
   entries?: {
     url: string;
@@ -147,6 +151,20 @@ export async function processJob(job: Job): Promise<JobResult> {
       const { batchPages } = await import("./browser.js");
       const result = await batchPages(profilePath, browserDir, job.entries);
       return result;
+    }
+    case "submit": {
+      if (!job.url || !job.file) {
+        return fail("usage", "op=submit requires url and file");
+      }
+      const { submitAssignment } = await import("./browser.js");
+      return submitAssignment(profilePath, browserDir, {
+        url: job.url,
+        file: job.file,
+        action: job.action ?? "draft",
+        ssoApp: job.ssoApp,
+        semester: job.semester,
+        waitMs: job.waitMs,
+      });
     }
     case "crawl": {
       if (!job.url || !job.linkSelector || !job.extract) {
