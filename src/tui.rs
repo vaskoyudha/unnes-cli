@@ -71,6 +71,12 @@ pub struct TuiState {
     pub peserta_loaded: bool,
     pub peserta_note: String,
     pub jadwal_sel: usize,
+    // Tugas submit overlay ('u' on a task): type a file path, Enter uploads it
+    pub submit_open: bool,
+    pub submit_input: String,
+    pub submit_cid: u32,
+    pub submit_course: String,
+    pub submit_note: String,
 }
 
 fn probe_session(home: &UnnesHome, profile: &str) -> (bool, String) {
@@ -182,6 +188,11 @@ impl TuiState {
             peserta_loaded: false,
             peserta_note: String::new(),
             jadwal_sel: 0,
+            submit_open: false,
+            submit_input: String::new(),
+            submit_cid: 0,
+            submit_course: String::new(),
+            submit_note: String::new(),
         }
     }
 
@@ -365,13 +376,50 @@ fn draw(state: &TuiState, selected: usize, frame: &mut Frame) {
         _ => draw_changelog(state, frame, body),
     }
 
+    // submit overlay: a centered input prompt for the file path
+    if state.submit_open {
+        let overlay = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length((area.height / 2) - 4),
+                Constraint::Length(8),
+                Constraint::Min(0),
+            ])
+            .split(area);
+        let input_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length((area.width / 2) - 20),
+                Constraint::Length(40),
+                Constraint::Min(0),
+            ])
+            .split(overlay[1]);
+        let prompt = vec![
+            Line::from(Span::styled(
+                format!("Upload file untuk tugas {}", state.submit_course),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("Path file: {}", state.submit_input)),
+            Line::from("[Enter] upload draft   [Esc] batal"),
+        ];
+        frame.render_widget(
+            Paragraph::new(prompt).block(Block::default().borders(Borders::ALL).title("Upload")),
+            input_area[1],
+        );
+    }
+
     // footer: loading progress while sources are still coming in, then
     // the first panel error (if any) once everything settled.
     let mut pending: Vec<&str> = Vec::new();
     if !state.kurikulum_loaded { pending.push("kurikulum"); }
     if !state.jadwal_loaded { pending.push("jadwal"); }
     if !state.tugas_loaded { pending.push("tugas"); }
-    let foot = format!("[1-5/Tab] panel   [r] refresh   [q/Esc] keluar   {}", state.refresh_note);
+    // submit_note (result of a TUI upload) appears in the footer
+    let foot = if state.submit_note.is_empty() {
+        format!("[1-5/Tab] panel   [r] refresh   [q/Esc] keluar   {}", state.refresh_note)
+    } else {
+        format!("{}   • {}", state.refresh_note, state.submit_note)
+    };
     let line = if pending.is_empty() {
         let err = [&state.kurikulum_note, &state.jadwal_note, &state.tugas_note].iter().find(|s| !s.is_empty()).map(|s| s.as_str()).unwrap_or("");
         if err.is_empty() { foot } else { format!("{}   + {}", foot, err) }
@@ -780,6 +828,36 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
         });
     }
 
+    /// Background submit: upload `file` to the task `cmid` as a DRAFT via the
+    /// op=submit fetcher path (same machinery as `unnes tugas submit`). Publishes
+    /// the outcome into submit_note so the user sees the result in the TUI.
+    fn submit_tugas(home: &UnnesHome, profile: &str, cmid: u32, file: &str, target: &Arc<Mutex<Option<TuiState>>>) {
+        let h = home.clone();
+        let p = profile.to_string();
+        let f = file.to_string();
+        let t = Arc::clone(target);
+        std::thread::spawn(move || {
+            let mut job = crate::fetcher::job("submit", &p);
+            job["url"] = serde_json::json!(format!("https://elena.unnes.ac.id/mod/assign/view.php?id={cmid}"));
+            job["file"] = serde_json::json!(f);
+            job["action"] = serde_json::json!("draft");
+            job["ssoApp"] = serde_json::json!("30");
+            job["semester"] = serde_json::json!(crate::tugas::configured_elena_semester(&h).unwrap_or_else(|| "20261".into()));
+            dbg(&h, &format!("submit tugas {cmid}: file {f}"));
+            let note = match crate::fetcher::run_job(&h, &p, job) {
+                Ok(res) if res.ok => res.message.clone().unwrap_or_else(|| "upload ok (draft)".into()),
+                Ok(res) => res.error.as_ref().map(|e| e.message.clone()).unwrap_or_else(|| "upload gagal".into()),
+                Err(e) => format!("{e:#}"),
+            };
+            dbg(&h, &format!("submit tugas {cmid}: {note}"));
+            if let Ok(mut g) = t.lock() {
+                if let Some(st) = g.as_mut() {
+                    st.submit_note = note;
+                }
+            }
+        });
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -808,7 +886,48 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                 if key.kind == KeyEventKind::Press {
                     let peserta_open = { state.lock().ok().and_then(|g| g.as_ref().map(|s| s.peserta_open)).unwrap_or(false) };
                     let tugas_items = { state.lock().ok().and_then(|g| g.as_ref().map(|s| s.items.len())).unwrap_or(0) };
+                    let submit_open = { state.lock().ok().and_then(|g| g.as_ref().map(|s| s.submit_open)).unwrap_or(false) };
                     match key.code {
+                        // ---- submit overlay keys (always first, before everything else) ----
+                        KeyCode::Char(c) if submit_open => {
+                            if let Ok(mut g) = state.lock() {
+                                if let Some(st) = g.as_mut() {
+                                    st.submit_input.push(c);
+                                }
+                            }
+                        }
+                        KeyCode::Backspace if submit_open => {
+                            if let Ok(mut g) = state.lock() {
+                                if let Some(st) = g.as_mut() {
+                                    st.submit_input.pop();
+                                }
+                            }
+                        }
+                        KeyCode::Enter if submit_open => {
+                            // submit the file path (draft) in background
+                            let (cmid, file) = {
+                                let g = state.lock().unwrap();
+                                let st = g.as_ref().expect("tui state");
+                                (st.submit_cid, st.submit_input.clone())
+                            };
+                            if !file.is_empty() && cmid > 0 {
+                                if let Ok(mut g) = state.lock() {
+                                    if let Some(st) = g.as_mut() {
+                                        st.submit_open = false;
+                                        st.submit_note = "mengupload...".into();
+                                    }
+                                }
+                                submit_tugas(home, profile, cmid, &file, &state);
+                            }
+                        }
+                        KeyCode::Esc if submit_open => {
+                            if let Ok(mut g) = state.lock() {
+                                if let Some(st) = g.as_mut() {
+                                    st.submit_open = false;
+                                }
+                            }
+                        }
+                        // ---- normal keys ----
                         KeyCode::Char('q') | KeyCode::Esc => {
                             if peserta_open {
                                 // Esc closes the roster overlay first
@@ -864,16 +983,42 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                             }
                         }
                         KeyCode::Enter if selected == 3 && tugas_items > 0 => {
-                            // open the selected task's URL in the default browser
+                            // open the task in the profile browser: the submission
+                            // form directly (action=editsubmission) when it is not
+                            // submitted, else the summary page (status/feedback).
                             let url = {
                                 let g = state.lock().unwrap();
                                 let st = g.as_ref().expect("tui state");
-                                st.items
-                                    .get(st.tugas_sel.min(st.items.len() - 1))
-                                    .map(|it| it.url.clone())
+                                match st.items.get(st.tugas_sel.min(st.items.len() - 1)) {
+                                    Some(it) => {
+                                        let sub = it.status == "Submitted";
+                                        let u = if sub {
+                                            it.url.clone()
+                                        } else {
+                                            format!("{}&action=editsubmission", it.url)
+                                        };
+                                        Some(u)
+                                    }
+                                    None => None,
+                                }
                             };
                             if let Some(url) = url {
                                 open_in_browser(home, profile, &url);
+                            }
+                        }
+                        KeyCode::Char('u') if selected == 3 && tugas_items > 0 => {
+                            // open the submit overlay: type a file path, Enter uploads
+                            dbg(home, "key u pressed on tugas panel");
+                            if let Ok(mut g) = state.lock() {
+                                if let Some(st) = g.as_mut() {
+                                    if let Some(it) = st.items.get(st.tugas_sel.min(st.items.len() - 1)) {
+                                        st.submit_open = true;
+                                        st.submit_input.clear();
+                                        st.submit_cid = it.url.split("id=").nth(1).and_then(|s| s.split('&').next()).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                                        st.submit_course = it.course.clone();
+                                        st.submit_note.clear();
+                                    }
+                                }
                             }
                         }
                         KeyCode::Enter if selected == 2 && !peserta_open => {
@@ -911,9 +1056,11 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                             }
                         }
                         KeyCode::Char(c) if ('1'..='5').contains(&c) => {
+                            dbg(home, &format!("key number {c} -> panel {}", (c as usize) - ('1' as usize)));
                             selected = (c as usize) - ('1' as usize);
                         }
-                        _ => {}
+                        KeyCode::Char(c) => dbg(home, &format!("key char {c:?} (unhandled)")),
+                        other => dbg(home, &format!("key other {other:?}")),
                     }
                 }
             }
