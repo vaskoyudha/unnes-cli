@@ -1,0 +1,27 @@
+[
+  {
+    "title": "xurl — curl-style command line client for the X API - X",
+    "href": "https://docs.x.com/tools/xurl",
+    "body": "Install and use xurl, a curl-style CLI for the X API with built-in OAuth that lets you test endpoints, sign requests, and prototype from the terminal."
+  },
+  {
+    "title": "GitHub - xdevplatform/xurl: The official CLI for the X API",
+    "href": "https://github.com/xdevplatform/xurl/",
+    "body": "xurl - A curl-like CLI Tool for the X API A command-line tool for interacting with the X (formerly Twitter) API, supporting both OAuth 1.0a and OAuth 2.0 authentication."
+  },
+  {
+    "title": "public-clis/twitter-cli: A CLI for Twitter/X - GitHub",
+    "href": "https://github.com/public-clis/twitter-cli",
+    "body": "twitter-cli A terminal-first CLI for Twitter/X: read timelines, bookmarks, and user profiles without API keys."
+  },
+  {
+    "title": "Xurl — X/Twitter via xurl CLI: raw post search, posting, DM ...I hope this helps. If you need more help let me know ...you can run a terminal AI agent that posts, searches, and ...Why X Built Its Own CLI — and Why the Agent Interface Era ...",
+    "href": "https://hermes-agent.nousresearch.com/docs/user-guide/skills/bundled/social-media/social-media-xurl",
+    "body": "This skill replaces the older xitter skill (which wrapped a third-party Python CLI). xurl is maintained by the X developer platform team, supports OAuth 2.0 PKCE with auto-refresh, and covers a substantially larger API surface. Apr 21, 2026 · •Test with xurl whoami or xurl timeline in your terminal first. •Full command list and raw API access (xurl /2/tweets etc.) are in the skill docs. That’s it: once set up, your OpenClaw agent has full X superpowers running locally. May 20, 2026 · Hermes is an open-source AI agent from Nous Research that runs in your terminal. Out of the box it comes with a skill called xurl that lets the agent read and write to X on your behalf — posting, searching, pulling bookmarks, managing lists, and more — all through natural language. May 21, 2026 · X (Twitter) just open-sourced xurl, their official X API command-line tool. The real signal isn't the tool — it's that X officially admits agents are now first-class API consumers. I rewired three accounts onto it and packaged it as an OpenClaw skill. What is X/Twitter via xurl CLI? X/Twitter via xurl CLI: raw post search, posting, DM, media. The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active. xurl is the X developer platform's official CLI for the X API. How do I use xurl? Install and use xurl, a curl-style CLI for the X API with built-in OAuth that lets you test endpoints, sign requests, and prototype from the terminal. xurl is a curl-like command-line tool for the X API. It handles OAuth authentication automatically so you can make API requests without manually managing tokens or signing requests. How do AI agents use xurl? xurl includes a SKILL.md file that describes its capabilities in a machine-readable format. AI agents can use this to understand how to invoke xurl commands on your behalf. Install and use xurl, a curl-style CLI for the X API with built-in OAuth that lets you test endpoints, sign requests, and prototype from the terminal. What is a terminal-first CLI for Twitter/X? A terminal-first CLI for Twitter/X: read timelines, bookmarks, and user profiles without API keys. English | 中文 Read: AI Agent Tip: Prefer --yaml for structured output unless a strict JSON parser is required. Non-TTY stdout defaults to YAML automatically. Use --max to limit results. Write: Auth & Anti-Detection: Upgrade to the latest version:"
+  },
+  {
+    "title": "you can run a terminal AI agent that posts, searches, and ...",
+    "href": "https://x.com/Blum_OG/status/2057089546127294470",
+    "body": "May 20, 2026 · Hermes is an open-source AI agent from Nous Research that runs in your terminal. Out of the box it comes with a skill called xurl that lets the agent read and write to X on your behalf — posting, searching, pulling bookmarks, managing lists, and more — all through natural language."
+  }
+]

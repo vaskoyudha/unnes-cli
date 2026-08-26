@@ -1,0 +1,27 @@
+[
+  {
+    "title": "X Twitter MCP Server — Twitter data access for AI",
+    "href": "https://thedailyworkflow.com/mcp/server/x-twitter-mcp-server",
+    "body": "Apr 21, 2026 · X Twitter MCP Server allows AI assistants to interact with Twitter (X) data, such as fetching tweets, searching timelines, and managing user profiles, directly through the Model Context Protocol."
+  },
+  {
+    "title": "GitHub - Infatoshi/x-mcp: MCP server for the X (Twitter) API ...",
+    "href": "https://github.com/Infatoshi/x-mcp",
+    "body": "Feb 7, 2026 · An MCP (Model Context Protocol) server that gives AI agents full access to the X (Twitter) API. Post tweets, search, read timelines, like, retweet, upload media -- all through natural language."
+  },
+  {
+    "title": "X (Twitter) MCP Server - GitHub",
+    "href": "https://github.com/HosakaKeigo/x-mcp-server",
+    "body": "This is a Model Context Protocol (MCP) server for the X (formerly Twitter) API. From an MCP client such as Claude Desktop you can post tweets, read timelines, search posts, and more."
+  },
+  {
+    "title": "MCP servers for the X API and X developer docs - X",
+    "href": "https://docs.x.com/tools/mcp",
+    "body": "Connect any MCP-compatible AI tool (Grok Build, Cursor, Claude, VS Code, and others) directly to the X API. The model can then search the full archive, look up users, manage bookmarks, fetch trends and news, and draft Articles — all with your own X account’s permissions."
+  },
+  {
+    "title": "Twitter MCP Server — Twitter/X Data Tools for Claude & Cursor",
+    "href": "https://twitterapi.io/twitter-mcp-server",
+    "body": "Nov 25, 2025 · The Twitter MCP Server is an open-source Model Context Protocol server that gives Claude, Cursor and other AI agents direct, structured access to live Twitter/X data."
+  }
+]

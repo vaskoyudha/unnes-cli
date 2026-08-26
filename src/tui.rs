@@ -690,7 +690,7 @@ fn draw_tugas(state: &TuiState, frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Table::new(rows, widths)
             .header(Row::new(vec!["flag", "tipe", "course", "nama", "due", "status"]).style(Style::default().add_modifier(Modifier::BOLD)))
-            .block(block("Tugas & Kuis Elena - ↑↓ pilih · Enter: buka di browser")),
+            .block(block("Tugas & Kuis Elena - ↑↓ pilih · u: upload file · Enter: buka di browser")),
         area,
     );
 }
@@ -988,6 +988,14 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                                             pick_file_and_submit(home, profile, cmid, &it.course, &state);
                                         }
                                     }
+                                }
+                            }
+                        }
+                        KeyCode::Char('u') => {
+                            // 'u' outside the Tugas panel: tell the user where to go
+                            if let Ok(mut g) = state.lock() {
+                                if let Some(st) = g.as_mut() {
+                                    st.submit_note = "upload: buka panel Tugas (4) lalu pilih tugas dan tekan u".into();
                                 }
                             }
                         }

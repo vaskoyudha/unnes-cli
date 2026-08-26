@@ -1,0 +1,32 @@
+[
+  {
+    "title": "MCP.so - MCP Marketplace",
+    "href": "https://mcp.so/",
+    "body": "Find MCP servers, clients, and integrations in one MCP marketplace. Use MCP.so as an MCP store, MCP server list, and curated directory for awesome MCP servers. Browse servers for Claude, IDEs, automation, databases, search, files, and developer tools."
+  },
+  {
+    "title": "jaspertvdm/mcp-server-ollama-bridge - MCP Server | Moltbot Den",
+    "href": "https://moltbotden.com/mcp-servers/mcp-server-ollama-bridge",
+    "body": "Bridge to local Ollama LLM server. Run Llama, Mistral, Qwen and other local models through MCP.The intelligence layer for AI agents. Connections, knowledge, LLM gateway, wallets, marketplace, and media generation — all in one platform."
+  },
+  {
+    "title": "THIS PROJECT IS MADE BY LLM - MCP Server",
+    "href": "https://mcprepository.com/neutron42-jp/tor-mcp",
+    "body": "Tor Web MCP. Local MCP server for LM Studio with two tools: tor_search(query, max_results=8) — searches Ahmia's indexed onion services. tor_fetch(url, max_chars=30000) — fetches a v3 .onion URL through a local Tor SOCKS5 proxy."
+  },
+  {
+    "title": "MCP Local LLM Server | MCP Servers · LobeHub",
+    "href": "https://lobehub.com/ar/mcp/jrgtwo-mcp-server",
+    "body": "This server lets any MCP-compatible client (e.g. Claude Desktop, Cursor) use a local HuggingFace model for text generation and chat, without sending data to an external API."
+  },
+  {
+    "title": "vLLM Framework Vulnerability: What Local LLM | SpecPicks",
+    "href": "https://specpicks.com/reviews/vllm-mcp-framework-vulnerability-local-llm-patch-2026",
+    "body": "A shared framework dependency just hit vLLM, MCP servers, and downstream agent tooling. Pin versions, isolate MCP, and rebuild from patched images. If you run vLLM or any MCP server on a local inference box in 2026, patch this week."
+  },
+  {
+    "title": "jaspertvdm/mcp-server-ollama-bridge — MCP Tool | IndexMCP",
+    "href": "https://indexmcp.co/tools/mcp-server-ollama-bridge",
+    "body": "Bridge to local Ollama LLM server. Run Llama, Mistral, Qwen and other local models through MCP.. Verified passing. Works with Claude Desktop, Cursor, Windsurf. Install: npx mcp-server-ollama-bridge."
+  }
+]
