@@ -654,20 +654,36 @@ fn draw_changelog(state: &TuiState, frame: &mut Frame, area: Rect) {
     frame.render_widget(List::new(items).block(block("Changelog")), area);
 }
 
-/// Open a URL in the default browser (xdg-open on Linux, open on macOS,
-/// start on Windows). Best-effort: a missing launcher is ignored.
-fn open_in_browser(url: &str) {
-    let launcher = if cfg!(target_os = "macos") {
-        "open"
-    } else if cfg!(target_os = "windows") {
-        "cmd"
-    } else {
-        "xdg-open"
-    };
-    match std::process::Command::new(launcher).arg(url).spawn() {
-        Ok(mut child) => { let _ = child.wait(); }
-        Err(_) => eprintln!("tidak bisa membuka browser: tidak ada {launcher}"),
-    }
+/// Open a task URL in the PERSISTENT profile browser (headed) so the user
+/// sees the real logged-in page. The system default browser (e.g. Firefox)
+/// has no UNNES session cookies and would bounce to the SSO gate - the
+/// profile browser carries the session, so it lands on the assignment page.
+/// Runs in a background thread so the dashboard stays responsive.
+fn open_in_browser(home: &UnnesHome, profile: &str, url: &str) {
+    let h = home.clone();
+    let p = profile.to_string();
+    let u = url.to_string();
+    std::thread::spawn(move || {
+        let mut job = crate::fetcher::job("open", &p);
+        job["url"] = serde_json::json!(u);
+        job["ssoApp"] = serde_json::json!("30");
+        job["semester"] = serde_json::json!(crate::tugas::configured_elena_semester(&h).unwrap_or_else(|| "20261".into()));
+        match crate::fetcher::run_job(&h, &p, job) {
+            Ok(res) if res.ok => {
+                let msg = res.message.as_deref().unwrap_or("ok");
+                dbg(&h, &format!("open task: {msg}"));
+            }
+            Ok(res) => {
+                let msg = res.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+                dbg(&h, &format!("open task FAIL: {msg}"));
+                eprintln!("gagal membuka tugas di browser: {msg}");
+            }
+            Err(e) => {
+                dbg(&h, &format!("open task FAIL: {e:#}"));
+                eprintln!("gagal membuka tugas di browser: {e:#}");
+            }
+        }
+    });
 }
 // ---------------------------------------------------------------------------
 // Event loop
@@ -857,7 +873,7 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                                     .map(|it| it.url.clone())
                             };
                             if let Some(url) = url {
-                                open_in_browser(&url);
+                                open_in_browser(home, profile, &url);
                             }
                         }
                         KeyCode::Enter if selected == 2 && !peserta_open => {

@@ -8,7 +8,7 @@ import { ExtractSpec, extractRecords } from "./extract.js";
 
 export interface Job {
   contract: number;
-  op: "get" | "login" | "logout" | "sso" | "page" | "crawl" | "batch" | "submit";
+  op: "get" | "login" | "logout" | "sso" | "page" | "crawl" | "batch" | "submit" | "open";
   profile?: string;
   /** used by login/logout when the job URL family is not explicit */
   baseUrl?: string;
@@ -39,6 +39,8 @@ export interface Job {
   file?: string;
   /** op=submit: "draft" (default) or "submit" (finalize) */
   action?: "draft" | "submit";
+  /** op=open: max ms to keep the profile browser window open (default 10 min) */
+  maxMs?: number;
   /** op=batch: entries to render in one shared browser session */
   entries?: {
     url: string;
@@ -151,6 +153,16 @@ export async function processJob(job: Job): Promise<JobResult> {
       const { batchPages } = await import("./browser.js");
       const result = await batchPages(profilePath, browserDir, job.entries);
       return result;
+    }
+    case "open": {
+      if (!job.url) return fail("usage", "op=open requires url");
+      const { openInProfileBrowser } = await import("./browser.js");
+      return openInProfileBrowser(profilePath, browserDir, {
+        url: job.url,
+        ssoApp: job.ssoApp,
+        semester: job.semester,
+        maxMs: job.maxMs,
+      });
     }
     case "submit": {
       if (!job.url || !job.file) {

@@ -308,7 +308,7 @@ const LOGIN_MARKERS = /login dengan unnes-id|masukan email dan password|username
 // Moodle shows an inline login page instead of redirecting.
 const MOODLE_LOGIN_MARKERS = /you are not logged in|you must be logged in|log in\s*\|/i;
 
-async function launchContext(browserDir: string): Promise<unknown> {
+async function launchContext(browserDir: string, headless = true): Promise<unknown> {
   const chromium = await import("playwright").then(
     (m) => (m as unknown as { chromium?: unknown; default?: { chromium?: unknown } }).chromium
       ?? (m as unknown as { default?: { chromium?: unknown } }).default?.chromium,
@@ -320,9 +320,11 @@ async function launchContext(browserDir: string): Promise<unknown> {
     chmodSync(browserDir, 0o700);
   } catch { /* best effort */ }
   // FedCm disabled so gapi falls back to the popup flow (see above).
+  // Headed is used by op=open so the user sees the real logged-in page in
+  // the profile browser (the system default browser has no session).
   return (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
     .launchPersistentContext(browserDir, {
-      headless: true,
+      headless,
       args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
     });
 }
@@ -1187,6 +1189,95 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ...base, error: { code: "internal", message: "submit failed: " + message } };
+  } finally {
+    try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// op: open - open a URL in the PERSISTENT profile browser (headed) so the
+// user sees the real logged-in page (session cookies live in the profile, not
+// in the system default browser - which is why xdg-open lands on the SSO gate).
+// Primes the gateway/elena session first, then keeps the window open until the
+// user closes it or the deadline passes.
+// ---------------------------------------------------------------------------
+
+export interface OpenOpts {
+  url: string;
+  ssoApp?: string;
+  semester?: string;
+  hubUrl?: string;
+  /** max ms to keep the window open; default 10 min */
+  maxMs?: number;
+}
+
+export interface OpenResult {
+  contract: number;
+  ok: boolean;
+  op: "open";
+  finalUrl: string | null;
+  sessionExpired: boolean;
+  message: string;
+  error?: { code: string; message: string };
+  [k: string]: unknown;
+}
+
+export async function openInProfileBrowser(jarPath: string, browserDir: string, opts: OpenOpts): Promise<OpenResult> {
+  const base = {
+    contract: 1, ok: false as boolean, op: "open" as const,
+    finalUrl: null as string | null, sessionExpired: false, message: ""
+  };
+  const log = (m: string) => console.error("[open] " + m);
+  if (process.env.UNNES_NO_BROWSER) {
+    return { ...base, error: { code: "usage", message: "open disabled via UNNES_NO_BROWSER" } };
+  }
+  let ctx: unknown;
+  try {
+    ctx = await launchContext(browserDir, false); // HEADED so the user sees it
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ...base, error: { code: "usage", message } };
+  }
+  const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
+  const P = page as {
+    goto(u: string, o?: unknown): Promise<unknown>;
+    url(): Promise<string>;
+    waitForTimeout(ms: number): Promise<void>;
+    isClosed(): boolean;
+  };
+  const deadline = Date.now() + (opts.maxMs ?? 10 * 60 * 1000);
+  try {
+    const hub = opts.hubUrl ?? "https://apps.unnes.ac.id";
+    if (opts.ssoApp) {
+      await P.goto(hub + "/" + opts.ssoApp, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await new Promise((r) => setTimeout(r, 6000));
+      let u = "";
+      try { u = await P.url(); } catch { /* closed */ }
+      if (/\/(auth\/)?login/i.test(u)) {
+        return { ...base, sessionExpired: true, error: { code: "session", message: "gateway session expired; run: unnes login" } };
+      }
+    }
+    if (opts.ssoApp === "30") {
+      await completeElenaSession(page as never, opts.semester ?? "20261");
+    }
+    await P.goto(opts.url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    log("opened " + opts.url + " in the profile browser");
+    // keep the window open until the user closes it (or the deadline)
+    while (Date.now() < deadline) {
+      try {
+        if (P.isClosed()) break;
+      } catch { break; }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    let finalUrl = "";
+    try { finalUrl = await P.url(); } catch { /* closed */ }
+    const jar = await CookieJar.load(jarPath);
+    const captured = await syncJarFromContext(ctx, jar);
+    await jar.save(jarPath);
+    return { ...base, ok: true, finalUrl: finalUrl || null, message: "opened; window closed by user", capturedCookies: captured };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ...base, error: { code: "internal", message: "open failed: " + message } };
   } finally {
     try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
   }
