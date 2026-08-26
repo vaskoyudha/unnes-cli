@@ -1114,7 +1114,9 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
       }
     }
 
-    // 6. open the filepicker dialog via its toolbar Add button
+    // 6. open the filepicker dialog via its toolbar Add button, then POLL for
+    //    the file input: the dialog renders asynchronously (0.5-3s), so a
+    //    single count right after the click races the DOM.
     let fileInputs = (await P.evaluate(() => document.querySelectorAll('input[type="file"]').length)) as number;
     if (fileInputs === 0) {
       const opened = await P.evaluate(() => {
@@ -1123,9 +1125,14 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
         (btn as HTMLElement).click();
         return true;
       });
-      await P.waitForTimeout(3000);
       log("filepicker opened: " + opened);
-      fileInputs = (await P.evaluate(() => document.querySelectorAll('input[type="file"]').length)) as number;
+      if (opened) {
+        for (let i = 0; i < 30; i++) {
+          fileInputs = (await P.evaluate(() => document.querySelectorAll('input[type="file"]').length)) as number;
+          if (fileInputs > 0) break;
+          await P.waitForTimeout(500);
+        }
+      }
       log("file inputs after open: " + fileInputs);
     }
 
@@ -1169,19 +1176,37 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
       await P.waitForTimeout(4000);
       log("clicked " + (opts.action === "submit" ? "Submit assignment" : "Save changes"));
     } catch (err) {
-      const msg = "file attached but the " + (opts.action === "submit" ? "Submit" : "Save") + " button was not found; the upload may still have been staged as a draft";
-      log(msg);
-      return { ...base, ok: true, finalUrl, message: msg };
+      // the finalize button may be absent (some renders auto-save on the filepicker
+      // upload); DON'T assume failure - fall through and read the real server state.
+      log("finalize button not found - checking the resulting submission state");
     }
 
-    // 9. report the resulting status
-    const finalHtml = await P.content();
-    const finalBody = finalHtml.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
+    // 9. report the resulting status from the ACTUAL page state. The upload
+    //    click often triggers a server redirect, so wait for the navigation to
+    //    settle before reading the page, with a couple of retries.
+    let finalHtml = "";
+    for (let i = 0; i < 5; i++) {
+      try {
+        finalHtml = await P.content();
+        if (finalHtml.length > 0) break;
+      } catch {
+        await P.waitForTimeout(1500);
+      }
+      await P.waitForTimeout(1500);
+    }
+    const finalBody = finalHtml.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 800);
     const submitted = /submitted for grading|diserahkan untuk dinilai/i.test(finalBody);
+    // "Edit submission"/"Remove submission" buttons prove a submission (draft) exists
+    const editBtn = /edit submission|remove submission/i.test(finalHtml);
+    const draft = editBtn || /submission draft|draft\b/i.test(finalBody) || /saved as draft/i.test(finalBody) || /belum dikumpulkan/i.test(finalBody);
+    const hasFile = /tugas[^\n]*\.pdf|file\ssubmissions?|draft\sfile/i.test(finalBody) || /pluginfile\.php\/.*assignsubmission_file/i.test(finalHtml);
     const status = (finalBody.match(/(?:Submission status|Status pengumpulan)[^.]{0,60}/i) || [""])[0].trim();
-    const message = (opts.action === "submit" && submitted)
+    log("final state: submitted=" + submitted + " draft=" + draft + " status=" + status);
+    const message = submitted
       ? "submitted for grading: " + status
-      : "file uploaded and saved as draft";
+      : (draft || hasFile)
+        ? "file uploaded and saved as draft"
+        : "file attached to the draft area; no submission status change detected";
     const jar = await CookieJar.load(jarPath);
     const captured = await syncJarFromContext(ctx, jar);
     await jar.save(jarPath);
