@@ -1103,7 +1103,7 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
     }))) as { alreadySubmitted: boolean; inForm: boolean; addSubText: string[] };
     log("state1: " + JSON.stringify(state1));
     if (state1.alreadySubmitted) {
-      const msg = "assignment is already submitted; edit/resubmit is not supported - nothing to upload";
+      const msg = "tugas sudah dikumpulkan (file sudah ada di server - buka dengan Enter untuk melihat)";
       log(msg);
       return { ...base, ok: true, finalUrl, message: msg };
     }

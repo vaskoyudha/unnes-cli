@@ -77,6 +77,8 @@ pub struct TuiState {
     pub submit_cid: u32,
     pub submit_course: String,
     pub submit_note: String,
+    /// true while a submit/upload is using the browser profile (Enter should wait)
+    pub submit_running: bool,
 }
 
 fn probe_session(home: &UnnesHome, profile: &str) -> (bool, String) {
@@ -193,6 +195,7 @@ impl TuiState {
             submit_cid: 0,
             submit_course: String::new(),
             submit_note: String::new(),
+            submit_running: false,
         }
     }
 
@@ -954,10 +957,20 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                             }
                         }
                         KeyCode::Enter if selected == 3 && tugas_items > 0 => {
-                            // open the task in the profile browser: the submission
-                            // form directly (action=editsubmission) when it is not
-                            // submitted, else the summary page (status/feedback).
-                            let url = {
+                            // Don't open the browser while a submit is using the
+                            // profile (they share the same persistent browser profile).
+                            let submit_busy = { state.lock().ok().and_then(|g| g.as_ref().map(|s| s.submit_running)).unwrap_or(false) };
+                            if submit_busy {
+                                if let Ok(mut g) = state.lock() {
+                                    if let Some(st) = g.as_mut() {
+                                        st.submit_note = "upload sedang berjalan, selesaikan dulu".into();
+                                    }
+                                }
+                            } else {
+                                // open the task in the profile browser: the submission
+                                // form directly (action=editsubmission) when it is not
+                                // submitted, else the summary page (status/feedback).
+                                let url = {
                                 let g = state.lock().unwrap();
                                 let st = g.as_ref().expect("tui state");
                                 match st.items.get(st.tugas_sel.min(st.items.len() - 1)) {
@@ -975,6 +988,7 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                             };
                             if let Some(url) = url {
                                 open_in_browser(home, profile, &url);
+                            }
                             }
                         }
                         KeyCode::Char('u') if selected == 3 && tugas_items > 0 => {
@@ -1062,6 +1076,12 @@ fn submit_tugas(home: &UnnesHome, profile: &str, cmid: u32, file: &str, target: 
     let p = profile.to_string();
     let f = file.to_string();
     let t = Arc::clone(target);
+    // Mark the profile as busy so Enter waits instead of crashing
+    if let Ok(mut g) = t.lock() {
+        if let Some(st) = g.as_mut() {
+            st.submit_running = true;
+        }
+    }
     std::thread::spawn(move || {
         let mut job = crate::fetcher::job("submit", &p);
         job["url"] = serde_json::json!(format!("https://elena.unnes.ac.id/mod/assign/view.php?id={cmid}"));
@@ -1070,18 +1090,28 @@ fn submit_tugas(home: &UnnesHome, profile: &str, cmid: u32, file: &str, target: 
         job["ssoApp"] = serde_json::json!("30");
         job["semester"] = serde_json::json!(crate::tugas::configured_elena_semester(&h).unwrap_or_else(|| "20261".into()));
         dbg(&h, &format!("submit tugas {cmid}: file {f}"));
-        let note = match crate::fetcher::run_job(&h, &p, job) {
-            Ok(res) if res.ok => res.message.clone().unwrap_or_else(|| "upload ok (draft)".into()),
-            Ok(res) => res.error.as_ref().map(|e| e.message.clone()).unwrap_or_else(|| "upload gagal".into()),
-            Err(e) => format!("{e:#}"),
+        let raw = match crate::fetcher::run_job(&h, &p, job) {
+            Ok(res) => res,
+            Err(e) => { let note = format!("{e:#}"); return finish_submit(&h, &t, &note); },
+        };
+        let note = if raw.ok {
+            raw.message.as_deref().unwrap_or("upload ok (draft)")
+        } else {
+            raw.error.as_ref().map(|e| e.message.as_str()).unwrap_or("upload gagal")
         };
         dbg(&h, &format!("submit tugas {cmid}: {note}"));
-        if let Ok(mut g) = t.lock() {
-            if let Some(st) = g.as_mut() {
-                st.submit_note = note;
-            }
-        }
+        finish_submit(&h, &t, note);
     });
+}
+
+/// Helper: clear submit_running and publish the outcome note.
+fn finish_submit(_home: &UnnesHome, target: &Arc<Mutex<Option<TuiState>>>, note: &str) {
+    if let Ok(mut g) = target.lock() {
+        if let Some(st) = g.as_mut() {
+            st.submit_running = false;
+            st.submit_note = note.to_string();
+        }
+    }
 }
 
 /// Pick a local file via a native dialog (zenity on Linux, osascript on macOS,
