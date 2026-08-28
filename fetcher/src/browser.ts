@@ -322,11 +322,23 @@ async function launchContext(browserDir: string, headless = true): Promise<unkno
   // FedCm disabled so gapi falls back to the popup flow (see above).
   // Headed is used by op=open so the user sees the real logged-in page in
   // the profile browser (the system default browser has no session).
-  return (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
-    .launchPersistentContext(browserDir, {
-      headless,
-      args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
-    });
+  // Retry loop: another operation (submit, open) may hold the profile lock.
+  // browserLogin has the same pattern for the same reason.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      return await (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
+        .launchPersistentContext(browserDir, {
+          headless,
+          args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
+        });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const busy = /user data directory is already in use|profile in use|singleton|process singleton|Opening in existing browser session/i.test(message);
+      if (!busy || attempt >= 3) throw err;
+      await new Promise((r) => setTimeout(r, 12000));
+    }
+  }
+  throw new Error("could not launch context after 4 attempts (profile locked)");
 }
 
 /** Copy every *.unnes.ac.id cookie from the browser context into the jar. */
@@ -1270,7 +1282,9 @@ export async function openInProfileBrowser(jarPath: string, browserDir: string, 
     waitForTimeout(ms: number): Promise<void>;
     isClosed(): boolean;
   };
-  const deadline = Date.now() + (opts.maxMs ?? 10 * 60 * 1000);
+  // 5 minutes default: short enough that other profile operations (submit,
+  // page render) don't starve waiting for the lock, long enough to read a page.
+  const deadline = Date.now() + (opts.maxMs ?? 5 * 60 * 1000);
   try {
     const hub = opts.hubUrl ?? "https://apps.unnes.ac.id";
     if (opts.ssoApp) {
