@@ -1193,30 +1193,46 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
       log("finalize button not found - checking the resulting submission state");
     }
 
-    // 9. report the resulting status from the ACTUAL page state. The upload
-    //    click often triggers a server redirect, so wait for the navigation to
-    //    settle before reading the page, with a couple of retries.
-    let finalHtml = "";
-    for (let i = 0; i < 5; i++) {
+    // 9. report the resulting status from the ACTUAL page state. In this
+    //    Moodle render, uploading through the filepicker can already SUBMIT the
+    //    assignment (no separate Save/Submit button), and the page then
+    //    redirects back to the summary view. So: poll for the summary view
+    //    (URL without action=editsubmission AND a status table present), then
+    //    read the status cell directly from the DOM instead of regexing the
+    //    first 800 chars of a mid-navigation page.
+    let finalState = { submitted: false, draft: false, status: "", hasFile: false, url: "" };
+    for (let i = 0; i < 20; i++) {
       try {
-        finalHtml = await P.content();
-        if (finalHtml.length > 0) break;
-      } catch {
-        await P.waitForTimeout(1500);
-      }
-      await P.waitForTimeout(1500);
+        finalState = (await P.evaluate(() => {
+          const url = location.href || "";
+          const inEditForm = /action=(addsubmission|editsubmission)/i.test(url);
+          // Moodle status table: first data cell after a "Submission status" row
+          let status = "";
+          const rows = document.querySelectorAll(".submissionstatustable tr, table.generaltable tr");
+          for (const tr of rows) {
+            const th = tr.querySelector("th");
+            if (th && /submission status|status pengumpulan/i.test(th.textContent || "")) {
+              const td = tr.querySelector("td");
+              status = (td ? td.textContent || "" : "").trim();
+              break;
+            }
+          }
+          const bodyText = document.body ? document.body.innerText : "";
+          const submitted = /submitted for grading|diserahkan untuk dinilai/i.test(status || bodyText.slice(0, 600));
+          const draft = !submitted && (/submission draft|draft\b|saved as draft|belum dikumpulkan/i.test(status) || /edit submission|remove submission/i.test(bodyText));
+          const hasFile = /pluginfile\.php\/.*assignsubmission_file|fileuploadsubmission|draft\sfile/i.test(document.body ? document.body.innerHTML : "") || /Laporan_[^\n]*\.pdf|[^\n]*\.pdf\n/i.test(bodyText);
+          return { submitted, draft, status, hasFile, url: url.slice(0, 120) };
+        })) as typeof finalState;
+        // summary view = not in the edit form anymore; keep polling until we get there
+        const notInEdit = !/action=(addsubmission|editsubmission)/i.test(finalState.url);
+        if (notInEdit && finalState.status !== "") break;
+      } catch { /* navigation in progress */ }
+      await P.waitForTimeout(1000);
     }
-    const finalBody = finalHtml.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 800);
-    const submitted = /submitted for grading|diserahkan untuk dinilai/i.test(finalBody);
-    // "Edit submission"/"Remove submission" buttons prove a submission (draft) exists
-    const editBtn = /edit submission|remove submission/i.test(finalHtml);
-    const draft = editBtn || /submission draft|draft\b/i.test(finalBody) || /saved as draft/i.test(finalBody) || /belum dikumpulkan/i.test(finalBody);
-    const hasFile = /tugas[^\n]*\.pdf|file\ssubmissions?|draft\sfile/i.test(finalBody) || /pluginfile\.php\/.*assignsubmission_file/i.test(finalHtml);
-    const status = (finalBody.match(/(?:Submission status|Status pengumpulan)[^.]{0,60}/i) || [""])[0].trim();
-    log("final state: submitted=" + submitted + " draft=" + draft + " status=" + status);
-    const message = submitted
-      ? "submitted for grading: " + status
-      : (draft || hasFile)
+    log("final state: " + JSON.stringify(finalState));
+    const message = finalState.submitted
+      ? "submitted for grading: " + finalState.status
+      : (finalState.draft || finalState.hasFile)
         ? "file uploaded and saved as draft"
         : "file attached to the draft area; no submission status change detected";
     const jar = await CookieJar.load(jarPath);
