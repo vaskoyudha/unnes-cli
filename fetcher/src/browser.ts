@@ -17,8 +17,76 @@
 // browser binary itself is installed separately (npx playwright install
 // chromium) and never needed for non-login operations.
 
-import { chmodSync, mkdirSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { chmodSync, mkdirSync, existsSync } from "node:fs";
 import { CookieJar } from "./cookiejar.js";
+
+function findChromeBinary(): string | null {
+  if (process.env.CHROME_BIN && existsSync(process.env.CHROME_BIN)) return process.env.CHROME_BIN;
+  const candidates = [
+    "/home/vyns/.local/bin/google-chrome",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return null;
+}
+
+interface CDPChromeInstance {
+  browser: { close: () => Promise<void>; contexts: () => unknown[] };
+  ctx: unknown;
+  proc: ChildProcess;
+}
+
+async function launchCDPChrome(browserDir: string, headless: boolean, port = 9224): Promise<CDPChromeInstance | null> {
+  const chromeBin = findChromeBinary();
+  if (!chromeBin) return null;
+  try {
+    mkdirSync(browserDir, { recursive: true });
+    chmodSync(browserDir, 0o700);
+  } catch { /* best effort */ }
+
+  const proc = spawn(chromeBin, [
+    `--remote-debugging-port=${port}`,
+    "--remote-debugging-address=127.0.0.1",
+    `--user-data-dir=${browserDir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-features=FedCm,CrossOriginOpenerPolicy",
+    "--disable-blink-features=AutomationControlled",
+    ...(headless ? ["--headless=new"] : []),
+    "about:blank",
+  ], { stdio: "ignore" });
+
+  let connected = false;
+  for (let i = 0; i < 25; i++) {
+    await new Promise((r) => setTimeout(r, 400));
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/json/version`);
+      if (res.ok) { connected = true; break; }
+    } catch {}
+  }
+  if (!connected) {
+    proc.kill();
+    return null;
+  }
+
+  try {
+    const mod = (await import("playwright")) as unknown as { chromium?: { connectOverCDP: (u: string) => Promise<unknown> }; default?: { chromium?: { connectOverCDP: (u: string) => Promise<unknown> } } };
+    const chromium = mod.chromium ?? mod.default?.chromium;
+    if (!chromium) { proc.kill(); return null; }
+    const browser = (await chromium.connectOverCDP(`http://127.0.0.1:${port}`)) as { close: () => Promise<void>; contexts: () => unknown[] };
+    const ctx = browser.contexts()[0];
+    return { browser, ctx, proc };
+  } catch {
+    proc.kill();
+    return null;
+  }
+}
 
 export interface BrowserLoginResult {
   contract: number;
@@ -228,6 +296,16 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
       try { landingUrl = await page.url(); } catch { /* page closed */ }
     }
 
+    // Prime Elena session (app 30) automatically right after gateway handoff
+    try {
+      const activeP = pages.find((p) => !p.isClosed()) || page;
+      if (!activeP.isClosed()) {
+        console.error("Priming Elena (app 30) session...");
+        await (activeP as { goto(u: string, o?: unknown): Promise<unknown> }).goto("https://apps.unnes.ac.id/30", { waitUntil: "domcontentloaded", timeout: 30000 });
+        await completeElenaSession(activeP as never, "20261");
+      }
+    } catch { /* best effort */ }
+
     const all = await ctx.cookies();
     const jar = CookieJar.empty();
     let captured = 0;
@@ -326,9 +404,11 @@ async function launchContext(browserDir: string, headless = true): Promise<unkno
   // browserLogin has the same pattern for the same reason.
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
+      const chromeBin = findChromeBinary();
       return await (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
         .launchPersistentContext(browserDir, {
           headless,
+          executablePath: chromeBin ?? undefined,
           args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
         });
     } catch (err) {
@@ -835,27 +915,43 @@ export async function autoLogin(
 // Returns a BrowserLoginResult when done, or null to try the next mode.
 // ---------------------------------------------------------------------------
 async function scriptedOAuth(jarPath: string, browserDir: string, headless: boolean): Promise<BrowserLoginResult | null> {
-  let chromium: unknown = null;
+  let cdpInstance: CDPChromeInstance | null = null;
+  let ctx: unknown = null;
+  let browserToClose: { close: () => Promise<void> } | null = null;
+
+  // 1. Try real Chrome via CDP first (Google does not block genuine Chrome binary)
   try {
-    const mod = (await import("playwright")) as unknown as { chromium?: unknown; default?: { chromium?: unknown } };
-    chromium = mod.chromium ?? mod.default?.chromium ?? null;
-  } catch { /* below */ }
-  if (!chromium) return null;
-  let ctx: unknown;
-  // Same self-serialization as browserLogin: a concurrent instance holding
-  // the profile makes us wait+retry instead of failing the login silently.
-  for (let attempt = 0; attempt < 4; attempt++) {
+    cdpInstance = await launchCDPChrome(browserDir, headless);
+    if (cdpInstance) {
+      ctx = cdpInstance.ctx;
+      browserToClose = cdpInstance.browser;
+    }
+  } catch { /* fall back to Playwright persistent context below */ }
+
+  // 2. Fallback to Playwright persistent context if CDP Chrome is not available
+  if (!ctx) {
+    let chromium: unknown = null;
     try {
-      ctx = await (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
-        .launchPersistentContext(browserDir, {
-          headless,
-          args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
-        });
-      break;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (!/user data directory is already in use|profile in use|singleton|process singleton/i.test(message)) return null;
-      await new Promise((r) => setTimeout(r, 12000));
+      const mod = (await import("playwright")) as unknown as { chromium?: unknown; default?: { chromium?: unknown } };
+      chromium = mod.chromium ?? mod.default?.chromium ?? null;
+    } catch { /* below */ }
+    if (!chromium) return null;
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        const chromeBin = findChromeBinary();
+        ctx = await (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
+          .launchPersistentContext(browserDir, {
+            headless,
+            executablePath: chromeBin ?? undefined,
+            args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
+          });
+        break;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!/user data directory is already in use|profile in use|singleton|process singleton/i.test(message)) return null;
+        await new Promise((r) => setTimeout(r, 12000));
+      }
     }
   }
   if (!ctx) return null;
@@ -952,7 +1048,11 @@ async function scriptedOAuth(jarPath: string, browserDir: string, headless: bool
   } catch {
     return null;
   } finally {
-    try { await C.close(); } catch { /* already closed */ }
+    try {
+      if (browserToClose) await browserToClose.close().catch(() => {});
+      else await C.close().catch(() => {});
+      if (cdpInstance?.proc) cdpInstance.proc.kill();
+    } catch { /* already closed */ }
   }
 }
 
@@ -987,6 +1087,13 @@ async function completeHubLogin(
     await P.waitForTimeout(2500);
     const body = String(await P.evaluate(() => document.body.innerText.slice(0, 200)));
     if (/Login dengan UNNES-ID|Single Sign On/i.test(body)) return null;
+
+    // Automatically prime Elena (App 30) session
+    try {
+      await P.goto("https://apps.unnes.ac.id/30", { waitUntil: "domcontentloaded", timeout: 30000 });
+      await completeElenaSession(P as never, "20261");
+    } catch { /* best effort */ }
+
     const jar = await CookieJar.load(jarPath);
     const captured = await syncJarFromContext(C, jar);
     await jar.save(jarPath);

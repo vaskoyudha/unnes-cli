@@ -6,6 +6,10 @@ import { LoginForm, opLogin, opLogout } from "./login.js";
 import { normalizeHtml } from "./normalize.js";
 import { ExtractSpec, extractRecords } from "./extract.js";
 
+// UNNES servers (specifically elena.unnes.ac.id) carry an incomplete intermediate
+// SSL certificate chain, which throws UNABLE_TO_VERIFY_LEAF_SIGNATURE in Node fetch.
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
 export interface Job {
   contract: number;
   op: "get" | "login" | "logout" | "sso" | "page" | "crawl" | "batch" | "submit" | "open";
