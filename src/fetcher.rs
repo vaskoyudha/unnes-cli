@@ -161,9 +161,10 @@ pub fn run_job(home: &UnnesHome, profile: &str, job: Value) -> Result<JobResult>
         .env("UNNES_HOME", &home.root)
         .env("UNNES_PROFILE", profile)
         .env("UNNES_USER_AGENT", "unnes-cli/0.1")
+        .env("NODE_NO_WARNINGS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .context("failed to spawn node; is Node.js >= 20 installed?")?;
 
@@ -177,6 +178,14 @@ pub fn run_job(home: &UnnesHome, profile: &str, job: Value) -> Result<JobResult>
         stdin.write_all(b"\n")?;
     }
 
+    let stderr_handle = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+    });
+
     let mut stdout = child
         .stdout
         .take()
@@ -184,9 +193,18 @@ pub fn run_job(home: &UnnesHome, profile: &str, job: Value) -> Result<JobResult>
     let mut raw = String::new();
     stdout.read_to_string(&mut raw)?;
 
+    let stderr_raw = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
     let status = child.wait().context("fetcher did not exit cleanly")?;
     if !status.success() {
-        bail!("fetcher exited with {status}");
+        let extra = if stderr_raw.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", stderr_raw.trim())
+        };
+        bail!("fetcher exited with {status}{extra}");
     }
 
     let line = raw.lines().next().ok_or_else(|| anyhow!("fetcher produced no output"))?;

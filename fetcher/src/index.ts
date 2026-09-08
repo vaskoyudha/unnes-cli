@@ -9,6 +9,7 @@ import { ExtractSpec, extractRecords } from "./extract.js";
 // UNNES servers (specifically elena.unnes.ac.id) carry an incomplete intermediate
 // SSL certificate chain, which throws UNABLE_TO_VERIFY_LEAF_SIGNATURE in Node fetch.
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+process.env.NODE_NO_WARNINGS = "1";
 
 export interface Job {
   contract: number;

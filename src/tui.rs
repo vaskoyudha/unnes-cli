@@ -384,7 +384,7 @@ fn draw(state: &TuiState, selected: usize, frame: &mut Frame) {
         let overlay = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length((area.height / 2) - 4),
+                Constraint::Length((area.height / 2).saturating_sub(4)),
                 Constraint::Length(8),
                 Constraint::Min(0),
             ])
@@ -392,7 +392,7 @@ fn draw(state: &TuiState, selected: usize, frame: &mut Frame) {
         let input_area = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length((area.width / 2) - 20),
+                Constraint::Length((area.width / 2).saturating_sub(20)),
                 Constraint::Length(40),
                 Constraint::Min(0),
             ])
@@ -492,7 +492,7 @@ fn draw_dashboard(state: &TuiState, frame: &mut Frame, area: Rect) {
 
     let right_lines = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Length(3), Constraint::Min(0)])
+        .constraints([Constraint::Length(4), Constraint::Length(4), Constraint::Min(0)])
         .split(right);
     let total = state.sks_total().max(1);
     let pct = (state.sks_lulus() as f64 / total as f64 * 100.0) as u16;
