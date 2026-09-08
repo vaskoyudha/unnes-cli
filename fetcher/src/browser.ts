@@ -18,8 +18,30 @@
 // chromium) and never needed for non-login operations.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, mkdirSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, existsSync, readlinkSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 import { CookieJar } from "./cookiejar.js";
+
+function cleanStaleSingleton(browserDir: string): void {
+  try {
+    const lockPath = join(browserDir, "SingletonLock");
+    if (existsSync(lockPath)) {
+      const target = readlinkSync(lockPath);
+      const match = target.match(/-(\d+)$/);
+      if (match) {
+        const pid = parseInt(match[1], 10);
+        try {
+          process.kill(pid, 0);
+        } catch {
+          // Process is dead: clear stale lock symlinks
+          try { unlinkSync(lockPath); } catch {}
+          try { unlinkSync(join(browserDir, "SingletonCookie")); } catch {}
+          try { unlinkSync(join(browserDir, "SingletonSocket")); } catch {}
+        }
+      }
+    }
+  } catch { /* best effort */ }
+}
 
 function findChromeBinary(): string | null {
   if (process.env.CHROME_BIN && existsSync(process.env.CHROME_BIN)) return process.env.CHROME_BIN;
@@ -43,6 +65,7 @@ interface CDPChromeInstance {
 }
 
 async function launchCDPChrome(browserDir: string, headless: boolean, port = 9224): Promise<CDPChromeInstance | null> {
+  cleanStaleSingleton(browserDir);
   const chromeBin = findChromeBinary();
   if (!chromeBin) return null;
   try {
@@ -120,6 +143,7 @@ interface PlaywrightCookie {
 }
 
 export async function browserLogin(jarPath: string, browserDir: string, hubUrl: string = HUB_URL): Promise<BrowserLoginResult> {
+  cleanStaleSingleton(browserDir);
   const fail = (code: string, message: string): BrowserLoginResult => ({
     contract: 1, ok: false, mode: "browser", landingUrl: null, capturedCookies: 0,
     error: { code, message },
@@ -387,6 +411,7 @@ const LOGIN_MARKERS = /login dengan unnes-id|masukan email dan password|username
 const MOODLE_LOGIN_MARKERS = /you are not logged in|you must be logged in|log in\s*\|/i;
 
 async function launchContext(browserDir: string, headless = true): Promise<unknown> {
+  cleanStaleSingleton(browserDir);
   const chromium = await import("playwright").then(
     (m) => (m as unknown as { chromium?: unknown; default?: { chromium?: unknown } }).chromium
       ?? (m as unknown as { default?: { chromium?: unknown } }).default?.chromium,
@@ -915,6 +940,7 @@ export async function autoLogin(
 // Returns a BrowserLoginResult when done, or null to try the next mode.
 // ---------------------------------------------------------------------------
 async function scriptedOAuth(jarPath: string, browserDir: string, headless: boolean): Promise<BrowserLoginResult | null> {
+  cleanStaleSingleton(browserDir);
   let cdpInstance: CDPChromeInstance | null = null;
   let ctx: unknown = null;
   let browserToClose: { close: () => Promise<void> } | null = null;

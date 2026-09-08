@@ -45,6 +45,7 @@ const CACHE_TTL_PESERTA: u64 = 24 * 3600; // rosters are fixed per semester
 pub struct TuiState {
     pub profile: String,
     pub session_valid: bool,
+    pub session_loaded: bool,
     pub session_note: String,
     pub nim: String,
     pub identitas: Vec<(String, String)>,
@@ -82,13 +83,40 @@ pub struct TuiState {
 }
 
 fn probe_session(home: &UnnesHome, profile: &str) -> (bool, String) {
+    // 1. Probe gateway hub
     let mut job = crate::fetcher::job("get", profile);
     job["url"] = serde_json::json!("https://apps.unnes.ac.id/gate/list");
-    match crate::fetcher::run_job(home, profile, job) {
-        Ok(res) if res.ok && !res.session_expired => (true, "VALID".into()),
-        Ok(_) => (false, "EXPIRED - run: unnes login".into()),
-        Err(e) => (false, format!("probe failed: {e:#}")),
+    if let Ok(res) = crate::fetcher::run_job(home, profile, job) {
+        if res.ok && !res.session_expired {
+            return (true, "VALID".into());
+        }
     }
+
+    // 2. Probe Elena: Elena session often stays alive much longer than the gateway
+    let mut elena_job = crate::fetcher::job("get", profile);
+    elena_job["url"] = serde_json::json!("https://elena.unnes.ac.id/my/");
+    if let Ok(res) = crate::fetcher::run_job(home, profile, elena_job) {
+        if res.ok && !res.session_expired {
+            return (true, "VALID".into());
+        }
+    }
+
+    // 3. Scripted auto-login (uses saved Google SSO profile headlessly)
+    if let Ok(cfg) = Config::load(home) {
+        if cfg.general.auto_relogin {
+            if let Ok(_) = crate::watch::auto_login(home, profile, false) {
+                let mut retry_job = crate::fetcher::job("get", profile);
+                retry_job["url"] = serde_json::json!("https://apps.unnes.ac.id/gate/list");
+                if let Ok(rres) = crate::fetcher::run_job(home, profile, retry_job) {
+                    if rres.ok && !rres.session_expired {
+                        return (true, "VALID".into());
+                    }
+                }
+            }
+        }
+    }
+
+    (false, "EXPIRED - run: unnes login".into())
 }
 
 fn biodata_rows(home: &UnnesHome) -> Vec<(String, String)> {
@@ -148,6 +176,9 @@ impl TuiState {
     pub fn refresh_skeleton(prev: Option<Self>, profile: &str) -> Self {
         let mut st = Self::skeleton(profile);
         if let Some(p) = prev {
+            st.session_valid = p.session_valid;
+            st.session_loaded = p.session_loaded;
+            st.session_note = p.session_note;
             st.nim = p.nim;
             st.identitas = p.identitas;
             st.kursus = p.kursus;
@@ -166,6 +197,7 @@ impl TuiState {
         Self {
             profile: profile.to_string(),
             session_valid: false,
+            session_loaded: false,
             session_note: "memuat...".into(),
             nim: String::new(),
             identitas: Vec::new(),
@@ -205,6 +237,7 @@ impl TuiState {
         dbg(home, &format!("load: session valid={} note={}", session_valid, session_note));
         self.session_valid = session_valid;
         self.session_note = session_note;
+        self.session_loaded = true;
         self.nim = kurikulum::resolve_nim(home).unwrap_or_default();
         self.identitas = biodata_rows(home);
     }
@@ -311,6 +344,7 @@ impl TuiState {
         dbg(home, &format!("load: re-probe session valid={} note={}", session_valid, session_note));
         self.session_valid = session_valid;
         self.session_note = session_note;
+        self.session_loaded = true;
         self.log = changelog::read(home, None, None).unwrap_or_default();
         let mut pages = Vec::new();
         if let Ok(cfg) = Config::load(home) {
@@ -353,11 +387,17 @@ fn draw(state: &TuiState, selected: usize, frame: &mut Frame) {
         .split(area);
 
     // header
+    let session_span = if !state.session_loaded {
+        Span::styled("• session memuat...", Style::default().fg(Color::Yellow))
+    } else if state.session_valid {
+        Span::styled("• session VALID", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("• session EXPIRED", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    };
     let header = Line::from(vec![
         Span::styled(" unnes ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
         Span::raw(format!("  {}  ", state.profile)),
-        Span::styled(if state.session_valid { "• session VALID" } else { "• session EXPIRED" },
-            Style::default().fg(if state.session_valid { Color::Green } else { Color::Red })),
+        session_span,
         Span::raw(format!("  NIM {}", state.nim)),
     ]);
     frame.render_widget(Paragraph::new(header).block(Block::default().borders(Borders::ALL)), chunks[0]);
