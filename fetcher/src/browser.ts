@@ -303,12 +303,9 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     // the 'Login dengan UNNES-ID' button calls gAuth2.signIn() (Google popup ->
     // accounts.google.com, which closes after consent), then onSignIn() POSTs
     // to /google/auth and the main tab navigates to the server-issued route
-    // (window.location.href = obj.route). That route navigation is the handoff:
-    //  - the login page never navigates on its own, so ANY path/query change
-    //    on the hub host means the route redirect happened, and
-    //  - a tab on another *.unnes.ac.id subdomain is the route landing too.
-    // The popup closing after consent is NORMAL and must NOT abort - only
-    // abort when every tab is gone or the browser process exits.
+    // (window.location.href = obj.route, e.g. /gate/list). That route navigation is the handoff.
+    // Note: apps.unnes.ac.id redirects / to /login when not authenticated, so /login
+    // is NOT a handoff - handoff requires leaving /login to /gate/list or another subdomain.
     while (Date.now() < deadline && done === null) {
       const poll = (async (): Promise<string | null> => {
         if (Date.now() - started < GRACE_MS) return null;
@@ -321,8 +318,9 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
           try { u = new URL(url); } catch { continue; }
           if (u.hostname.endsWith("unnes.ac.id")) {
             const leftHub = u.hostname !== "apps.unnes.ac.id";
-            const changed = u.pathname !== "/" || u.search !== "";
-            if (leftHub || changed) return "handoff";
+            const onLogin = u.pathname === "/" || u.pathname === "/login" || u.pathname.startsWith("/login/");
+            const isAuthRoute = u.pathname.startsWith("/gate") || u.pathname.startsWith("/dashboard") || /^\/\d+/.test(u.pathname);
+            if (leftHub || (!onLogin && isAuthRoute)) return "handoff";
           }
         }
         return null;
@@ -337,8 +335,12 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
       return fail("usage", "timed out waiting for login; no session captured");
     }
     if (done === "closed") {
-      await cleanup();
-      return fail("usage", "browser window was closed; login aborted, no session saved");
+      const currentCookies = await C.cookies().catch(() => []);
+      const hasSession = (currentCookies as PlaywrightCookie[]).some(c => c.name === "identitas_sso");
+      if (!hasSession) {
+        await cleanup();
+        return fail("usage", "browser window was closed; login aborted, no session saved");
+      }
     }
 
     // Give the handoff a moment to finish setting cookies.
