@@ -80,6 +80,8 @@ pub struct TuiState {
     pub submit_note: String,
     /// true while a submit/upload is using the browser profile (Enter should wait)
     pub submit_running: bool,
+    /// keybind cheat-sheet overlay (toggled with '?')
+    pub help_open: bool,
 }
 
 fn probe_session(home: &UnnesHome, profile: &str) -> (bool, String) {
@@ -187,6 +189,7 @@ impl TuiState {
             st.items = p.items;
             st.log = p.log;
             st.pages = p.pages;
+            st.help_open = p.help_open;
         }
         st
     }
@@ -228,6 +231,7 @@ impl TuiState {
             submit_course: String::new(),
             submit_note: String::new(),
             submit_running: false,
+            help_open: false,
         }
     }
 
@@ -424,16 +428,16 @@ fn draw(state: &TuiState, selected: usize, frame: &mut Frame) {
         let overlay = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length((area.height / 2).saturating_sub(4)),
-                Constraint::Length(8),
+                Constraint::Length((area.height / 2).saturating_sub(5)),
+                Constraint::Length(10),
                 Constraint::Min(0),
             ])
             .split(area);
         let input_area = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length((area.width / 2).saturating_sub(20)),
-                Constraint::Length(40),
+                Constraint::Length((area.width / 2).saturating_sub(30)),
+                Constraint::Length(60),
                 Constraint::Min(0),
             ])
             .split(overlay[1]);
@@ -443,11 +447,53 @@ fn draw(state: &TuiState, selected: usize, frame: &mut Frame) {
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(format!("Path file: {}", state.submit_input)),
+            Line::from("cth: ~/Downloads/tugas.pdf"),
+            Line::from("pdf/docx/zip/png/jpg · DRAFT, bisa diganti"),
             Line::from("[Enter] upload draft   [Esc] batal"),
         ];
         frame.render_widget(
             Paragraph::new(prompt).block(Block::default().borders(Borders::ALL).title("Upload")),
             input_area[1],
+        );
+    }
+
+    // help overlay ('?' anywhere): keybind cheat-sheet, incl. the upload walkthrough
+    if state.help_open {
+        let overlay = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length((area.height / 2).saturating_sub(9)),
+                Constraint::Length(18),
+                Constraint::Min(0),
+            ])
+            .split(area);
+        let help_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length((area.width / 2).saturating_sub(33)),
+                Constraint::Length(66),
+                Constraint::Min(0),
+            ])
+            .split(overlay[1]);
+        let keys = vec![
+            Line::from(Span::styled("Navigasi", Style::default().add_modifier(Modifier::BOLD))),
+            Line::from("1-5 / Tab       pindah panel (Dashboard Kurikulum Jadwal Tugas Changelog)"),
+            Line::from("↑ ↓             pilih baris di panel Jadwal / Tugas"),
+            Line::from("r               refresh (ambil ulang, tanpa cache)"),
+            Line::from("q / Esc         tutup overlay · keluar"),
+            Line::from("?               buka / tutup bantuan ini"),
+            Line::from(""),
+            Line::from(Span::styled("Upload tugas (panel Tugas, tekan 4 dulu)", Style::default().add_modifier(Modifier::BOLD))),
+            Line::from("1. pilih tugas dengan ↑ ↓"),
+            Line::from("2. tekan u → dialog file terbuka (atau ketik path manual)"),
+            Line::from("3. Enter = upload sebagai DRAFT — aman, bisa diganti"),
+            Line::from("4. Enter di tugas = buka halaman Elena di browser"),
+            Line::from(""),
+            Line::from("[? / Esc] tutup"),
+        ];
+        frame.render_widget(
+            Paragraph::new(keys).block(Block::default().borders(Borders::ALL).title("Bantuan keybind")),
+            help_area[1],
         );
     }
 
@@ -459,7 +505,7 @@ fn draw(state: &TuiState, selected: usize, frame: &mut Frame) {
     if !state.tugas_loaded { pending.push("tugas"); }
     // submit_note (result of a TUI upload) appears in the footer
     let foot = if state.submit_note.is_empty() {
-        format!("[1-5/Tab] panel   [r] refresh   [q/Esc] keluar   {}", state.refresh_note)
+        format!("[1-5/Tab] panel   [?] bantuan   [r] refresh   [q/Esc] keluar   {}", state.refresh_note)
     } else {
         format!("{}   • {}", state.refresh_note, state.submit_note)
     };
@@ -733,7 +779,7 @@ fn draw_tugas(state: &TuiState, frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Table::new(rows, widths)
             .header(Row::new(vec!["flag", "tipe", "course", "nama", "due", "status"]).style(Style::default().add_modifier(Modifier::BOLD)))
-            .block(block("Tugas & Kuis Elena - ↑↓ pilih · u: upload file · Enter: buka di browser")),
+            .block(block("Tugas & Kuis Elena - ↑↓ pilih · u: upload file · Enter: buka di browser · ?: bantuan")),
         area,
     );
 }
@@ -901,6 +947,7 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                     let peserta_open = { state.lock().ok().and_then(|g| g.as_ref().map(|s| s.peserta_open)).unwrap_or(false) };
                     let tugas_items = { state.lock().ok().and_then(|g| g.as_ref().map(|s| s.items.len())).unwrap_or(0) };
                     let submit_open = { state.lock().ok().and_then(|g| g.as_ref().map(|s| s.submit_open)).unwrap_or(false) };
+                    let help_open = { state.lock().ok().and_then(|g| g.as_ref().map(|s| s.help_open)).unwrap_or(false) };
                     match key.code {
                         // ---- submit overlay keys (always first, before everything else) ----
                         KeyCode::Char(c) if submit_open => {
@@ -942,8 +989,23 @@ pub fn run(home: &UnnesHome, profile: &str) -> Result<()> {
                             }
                         }
                         // ---- normal keys ----
+                        KeyCode::Char('?') if !submit_open => {
+                            // toggle the keybind cheat-sheet
+                            if let Ok(mut g) = state.lock() {
+                                if let Some(st) = g.as_mut() {
+                                    st.help_open = !st.help_open;
+                                }
+                            }
+                        }
                         KeyCode::Char('q') | KeyCode::Esc => {
-                            if peserta_open {
+                            if help_open {
+                                // Esc/?-sheet closes first, before roster or quit
+                                if let Ok(mut g) = state.lock() {
+                                    if let Some(st) = g.as_mut() {
+                                        st.help_open = false;
+                                    }
+                                }
+                            } else if peserta_open {
                                 // Esc closes the roster overlay first
                                 if let Ok(mut g) = state.lock() {
                                     if let Some(st) = g.as_mut() {
@@ -1225,4 +1287,50 @@ fn pick_file_and_submit(home: &UnnesHome, profile: &str, cmid: u32, course: &str
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn buffer_text(width: u16, height: u16, setup: impl FnOnce(&mut TuiState)) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut st = TuiState::skeleton("test");
+        setup(&mut st);
+        term.draw(|f| draw(&st, 3, f)).unwrap();
+        term.backend().buffer().content().iter().map(|c| c.symbol().to_string()).collect::<Vec<_>>().join("")
+    }
+
+    #[test]
+    fn help_overlay_renders_without_panic() {
+        for (w, h) in [(100, 30), (80, 24), (60, 20)] {
+            let txt = buffer_text(w, h, |st| st.help_open = true);
+            assert!(txt.contains("Bantuan keybind"), "help title missing at {w}x{h}");
+            assert!(txt.contains("Upload tugas"), "upload walkthrough missing at {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn submit_overlay_shows_draft_guidance() {
+        let txt = buffer_text(100, 30, |st| {
+            st.submit_open = true;
+            st.submit_course = "Grafika Komputer".into();
+            st.submit_input = "/home/vyns/Downloads/tugas.pdf".into();
+        });
+        assert!(txt.contains("DRAFT"), "draft note missing");
+        assert!(txt.contains("batal"), "cancel hint missing");
+    }
+
+    #[test]
+    fn footer_advertises_help() {
+        let txt = buffer_text(100, 30, |st| {
+            st.kurikulum_loaded = true;
+            st.jadwal_loaded = true;
+            st.tugas_loaded = true;
+        });
+        assert!(txt.contains("[?] bantuan"), "footer help hint missing");
+    }
 }
