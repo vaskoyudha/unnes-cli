@@ -1134,6 +1134,19 @@ async function scriptedOAuth(jarPath: string, browserDir: string, headless: bool
       return { contract: 1, ok: true, mode: "browser", landingUrl: await P.url(), capturedCookies: captured };
     }
 
+    // Session-burn guard: a HEADLESS visit to accounts.google.com while a live
+    // planted session exists makes Google distrust + invalidate it (observed:
+    // 40+ session cookies wiped right after a headless popup probe; the popup
+    // was served a blank identifier instead of the chooser). So when a Google
+    // session is present and we are headless, do NOT summon the popup - bail
+    // out and let the caller escalate to headed instead of burning the session.
+    try {
+      const pre = await (C as unknown as { cookies(): Promise<PlaywrightCookie[]> }).cookies().catch(() => [] as PlaywrightCookie[]);
+      const hasGoogleSession = (pre as PlaywrightCookie[]).some((c) =>
+        c.domain.includes("google") && /^(SID|SSID|HSID|SAPISID|APISID)$/.test(c.name));
+      if (hasGoogleSession && headless) return null;
+    } catch { /* best effort: proceed without the guard */ }
+
     // Channel A: postmessage listener + remember the gapi instance
     await P.evaluate(() => {
       (window as unknown as Record<string, unknown>).__idToken = null;
@@ -1196,7 +1209,16 @@ async function scriptedOAuth(jarPath: string, browserDir: string, headless: bool
     try {
       if (browserToClose) await browserToClose.close().catch(() => {});
       else await C.close().catch(() => {});
-      if (cdpInstance?.proc) cdpInstance.proc.kill();
+      // Same WAL reasoning as browserLogin cleanup: let Chrome flush to disk,
+      // SIGKILL only if it refuses to exit (killing loses the newest cookies).
+      const proc = cdpInstance?.proc;
+      if (proc && proc.exitCode === null) {
+        const exited = await new Promise<boolean>((resolve) => {
+          const t = setTimeout(() => resolve(false), 5000);
+          proc.once("exit", () => { clearTimeout(t); resolve(true); });
+        });
+        if (!exited) proc.kill();
+      }
     } catch { /* already closed */ }
   }
 }
