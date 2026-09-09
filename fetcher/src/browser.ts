@@ -18,27 +18,37 @@
 // chromium) and never needed for non-login operations.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, mkdirSync, existsSync, readlinkSync, unlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, existsSync, lstatSync, readlinkSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { CookieJar } from "./cookiejar.js";
 
 function cleanStaleSingleton(browserDir: string): void {
   try {
     const lockPath = join(browserDir, "SingletonLock");
-    if (existsSync(lockPath)) {
-      const target = readlinkSync(lockPath);
-      const match = target.match(/-(\d+)$/);
-      if (match) {
-        const pid = parseInt(match[1], 10);
-        try {
-          process.kill(pid, 0);
-        } catch {
-          // Process is dead: clear stale lock symlinks
-          try { unlinkSync(lockPath); } catch {}
-          try { unlinkSync(join(browserDir, "SingletonCookie")); } catch {}
-          try { unlinkSync(join(browserDir, "SingletonSocket")); } catch {}
+    let isDead = false;
+    try {
+      const stat = lstatSync(lockPath);
+      if (stat.isSymbolicLink()) {
+        const target = readlinkSync(lockPath);
+        const match = target.match(/-(\d+)$/);
+        if (match) {
+          const pid = parseInt(match[1], 10);
+          try {
+            process.kill(pid, 0);
+          } catch {
+            isDead = true;
+          }
+        } else {
+          isDead = true;
         }
       }
+    } catch {
+      // lockPath doesn't exist
+    }
+    if (isDead) {
+      try { unlinkSync(lockPath); } catch {}
+      try { unlinkSync(join(browserDir, "SingletonCookie")); } catch {}
+      try { unlinkSync(join(browserDir, "SingletonSocket")); } catch {}
     }
   } catch { /* best effort */ }
 }
@@ -185,32 +195,55 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     chmodSync(browserDir, 0o700);
   } catch { /* best effort */ }
 
-  let launched: unknown = null;
-  // Persistent profiles are locked while another Chromium uses them; two
-  // unnes instances logging in at the same time must wait, not fail.
-  for (let attempt = 0; attempt < 4; attempt++) {
+  let cdpInstance: CDPChromeInstance | null = null;
+  let browserToClose: { close: () => Promise<void> } | null = null;
+  let ctx: unknown = null;
+
+  const cleanup = async () => {
     try {
-      // FedCm disabled: gapi.auth2 must use the popup flow, which the
-      // scripted clicks can drive (FedCM never completes in automation).
-      launched = await chromium.launchPersistentContext(browserDir, {
-        headless: false,
-        args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
-      });
-      break;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const busy = /user data directory is already in use|profile in use|singleton|process singleton/i.test(message);
-      if (!busy) {
-        return fail("usage", "could not launch Chromium with persistent profile: " + message + " (is another unnes login running? delete " + browserDir + " to force a fresh profile)");
+      if (browserToClose) await browserToClose.close().catch(() => {});
+      else if (ctx) await (ctx as { close(): Promise<void> }).close().catch(() => {});
+      if (cdpInstance?.proc) cdpInstance.proc.kill();
+    } catch { /* best effort */ }
+  };
+
+  // 1. Try real Chrome via CDP first (Google does not block genuine Chrome binary)
+  try {
+    cdpInstance = await launchCDPChrome(browserDir, false);
+    if (cdpInstance) {
+      ctx = cdpInstance.ctx;
+      browserToClose = cdpInstance.browser;
+    }
+  } catch { /* fall back to Playwright persistent context below */ }
+
+  // 2. Fallback to Playwright persistent context if CDP Chrome is not available
+  if (!ctx) {
+    const chromeBin = findChromeBinary();
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        ctx = await (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
+          .launchPersistentContext(browserDir, {
+            headless: false,
+            executablePath: chromeBin ?? undefined,
+            args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
+          });
+        break;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const busy = /user data directory is already in use|profile in use|singleton|process singleton/i.test(message);
+        if (!busy) {
+          return fail("usage", "could not launch Chromium with persistent profile: " + message + " (is another unnes login running? delete " + browserDir + " to force a fresh profile)");
+        }
+        await new Promise((r) => setTimeout(r, 15000));
       }
-      // another instance has the profile: wait and retry (self-serialize)
-      await new Promise((r) => setTimeout(r, 15000));
     }
   }
-  if (!launched) {
-    return fail("usage", "could not launch Chromium: the profile is in use by another unnes instance - close it and retry, or run: unnes login");
+
+  if (!ctx) {
+    return fail("usage", "could not launch browser: the profile is in use by another unnes instance - close it and retry, or run: unnes login");
   }
-  const ctx = launched as {
+
+  const C = ctx as {
     pages(): PageLike[];
     newPage(): Promise<PageLike>;
     cookies(): Promise<PlaywrightCookie[]>;
@@ -221,8 +254,8 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
 
   try {
     // Reuse an existing page if the persistent profile restored one.
-    const initial = ctx.pages();
-    const page = initial.length > 0 ? initial[0] : await ctx.newPage();
+    const initial = C.pages();
+    const page = initial.length > 0 ? initial[0] : await C.newPage();
 
     // Track EVERY tab/popup: the hub's 'Login dengan UNNES-ID' button calls
     // gAuth2.signIn() which opens the Google account chooser in a POPUP, and
@@ -231,14 +264,17 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     // closed) or the browser process exits.
     const pages: PageLike[] = [...initial];
     let browserGone = false;
-    ctx.on("page", (p) => {
+    C.on("page", (p) => {
       pages.push(p);
       p.on("close", () => {
         const i = pages.indexOf(p);
         if (i >= 0) pages.splice(i, 1);
       });
     });
-    ctx.on("close", () => { browserGone = true; });
+    C.on("close", () => { browserGone = true; });
+    if (cdpInstance?.proc) {
+      cdpInstance.proc.on("exit", () => { browserGone = true; });
+    }
 
     if (!page.isClosed()) {
       await page.goto(hubUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -297,11 +333,11 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     }
 
     if (done === null) {
-      await ctx.close();
+      await cleanup();
       return fail("usage", "timed out waiting for login; no session captured");
     }
     if (done === "closed") {
-      await ctx.close();
+      await cleanup();
       return fail("usage", "browser window was closed; login aborted, no session saved");
     }
 
@@ -330,7 +366,7 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
       }
     } catch { /* best effort */ }
 
-    const all = await ctx.cookies();
+    const all = await C.cookies();
     const jar = CookieJar.empty();
     let captured = 0;
     const names = new Set<string>();
@@ -351,7 +387,7 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     await jar.save(jarPath);
 
     if (captured === 0) {
-      await ctx.close();
+      await cleanup();
       return fail("usage", "captured no unnes.ac.id cookies; did the Google sign-in complete?");
     }
 
@@ -361,11 +397,11 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     // only the Laravel session cookie (the hub disconnects Google itself via
     // auth2.disconnect(), which is why login always asks again).
     console.error("captured " + captured + " unnes.ac.id cookies: " + [...names].sort().join(", "));
-    await ctx.close();
+    await cleanup();
     return { contract: 1, ok: true, mode: "browser", landingUrl, capturedCookies: captured };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    try { await ctx.close(); } catch { /* already closed */ }
+    await cleanup();
     return fail("internal", "browser login failed: " + message);
   }
 }
@@ -1091,7 +1127,14 @@ async function completeHubLogin(
   idToken: string,
 ): Promise<BrowserLoginResult | null> {
   try {
-    const email = "vascoyudha1@students.unnes.ac.id";
+    let email = "vascoyudha1@students.unnes.ac.id";
+    try {
+      const parts = idToken.split(".");
+      if (parts.length >= 2) {
+        const payload = JSON.parse(Buffer.from(parts[1], "base64").toString("utf8"));
+        if (payload.email) email = payload.email;
+      }
+    } catch { /* fallback to default */ }
     const postRaw = String(await P.evaluate(async (a: { csrf: string; email: string; idToken: string }) => {
       const csrfEl = document.querySelector('meta[name="csrf-token"]') as HTMLMetaElement | null;
       const csrf = (csrfEl || { content: "" }).content || "";

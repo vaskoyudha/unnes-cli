@@ -178,10 +178,27 @@ pub fn run_job(home: &UnnesHome, profile: &str, job: Value) -> Result<JobResult>
         stdin.write_all(b"\n")?;
     }
 
+    let is_browser_login = job.get("op").and_then(|v| v.as_str()) == Some("login")
+        && job.get("mode").and_then(|v| v.as_str()) == Some("browser");
+
     let stderr_handle = child.stderr.take().map(|mut s| {
         std::thread::spawn(move || {
             let mut buf = String::new();
-            let _ = s.read_to_string(&mut buf);
+            if is_browser_login {
+                let mut chunk = [0u8; 512];
+                while let Ok(n) = s.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    let _ = std::io::stderr().write_all(&chunk[..n]);
+                    let _ = std::io::stderr().flush();
+                    if let Ok(text) = std::str::from_utf8(&chunk[..n]) {
+                        buf.push_str(text);
+                    }
+                }
+            } else {
+                let _ = s.read_to_string(&mut buf);
+            }
             buf
         })
     });
