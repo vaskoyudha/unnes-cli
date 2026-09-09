@@ -200,10 +200,22 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
   let ctx: unknown = null;
 
   const cleanup = async () => {
+    // Graceful close FIRST and let it finish: SIGKILLing Chrome drops the
+    // newest cookie writes (SQLite WAL not checkpointed), which are exactly
+    // the Google consent cookies set seconds before handoff. Kill is last
+    // resort only, so the planted Google session survives to disk.
     try {
       if (browserToClose) await browserToClose.close().catch(() => {});
       else if (ctx) await (ctx as { close(): Promise<void> }).close().catch(() => {});
-      if (cdpInstance?.proc) cdpInstance.proc.kill();
+      const proc = cdpInstance?.proc;
+      if (proc) {
+        const exited = await new Promise<boolean>((resolve) => {
+          if (proc.exitCode !== null) return resolve(true);
+          const t = setTimeout(() => resolve(false), 5000);
+          proc.once("exit", () => { clearTimeout(t); resolve(true); });
+        });
+        if (!exited) proc.kill();
+      }
     } catch { /* best effort */ }
   };
 
@@ -279,6 +291,24 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     if (!page.isClosed()) {
       await page.goto(hubUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     }
+
+    // If this profile holds no Google session, the popup forces full
+    // credential entry every time ("fresh spawning"). Open accounts.google.com
+    // first so the user can plant a persistent session there - next logins
+    // degrade to one click on the account chooser.
+    try {
+      const pre = await C.cookies().catch(() => [] as PlaywrightCookie[]);
+      const hasGoogle = (pre as PlaywrightCookie[]).some((c) => c.domain.includes("google"));
+      if (!hasGoogle) {
+        const gpage = await C.newPage().catch(() => null);
+        if (gpage && !(gpage as PageLike).isClosed()) {
+          await (gpage as PageLike).goto("https://accounts.google.com", { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+        }
+        console.error("NO Google session in this profile yet: sign into Google in the");
+        console.error("accounts.google.com tab first (stay signed in), THEN click");
+        console.error("'Login dengan UNNES-ID' on the hub tab.");
+      }
+    } catch { /* best effort: hub flow still works without it */ }
 
     // Instructions go to stderr: stdout is reserved for the single JSON result.
     console.error("");
@@ -399,10 +429,17 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     // only the Laravel session cookie (the hub disconnects Google itself via
     // auth2.disconnect(), which is why login always asks again).
     console.error("captured " + captured + " unnes.ac.id cookies: " + [...names].sort().join(", "));
-    console.error("note: the hub disconnects Google right after the handshake, so Google");
-    console.error("sign-in is asked on EVERY login by design - what persists is the UNNES");
-    console.error("session above (verify: unnes status). To also keep a Google account in");
-    console.error("this profile's toolbar, add it to Chrome itself once (profile menu).");
+    const googleNames = [...new Set((all as PlaywrightCookie[]).filter((c) => c.domain.includes("google")).map((c) => c.name))];
+    if (googleNames.length > 0) {
+      console.error("Google session kept in profile (" + googleNames.length + " cookies: " + googleNames.sort().join(", ") + ") - next login is one click.");
+    } else {
+      console.error("WARNING: no Google cookies kept in this profile - next login will ask");
+      console.error("for full credentials again. Fix: sign into the accounts.google.com tab");
+      console.error("directly (stay signed in) before clicking Login dengan UNNES-ID.");
+    }
+    console.error("note: the hub severs its own Google grant after every handshake, so the");
+    console.error("'Login dengan UNNES-ID' click stays - but with the session above it is");
+    console.error("one click, no password retype. Session check any time: unnes status.");
     await cleanup();
     return { contract: 1, ok: true, mode: "browser", landingUrl, capturedCookies: captured };
   } catch (err) {
