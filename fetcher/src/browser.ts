@@ -399,6 +399,10 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     // only the Laravel session cookie (the hub disconnects Google itself via
     // auth2.disconnect(), which is why login always asks again).
     console.error("captured " + captured + " unnes.ac.id cookies: " + [...names].sort().join(", "));
+    console.error("note: the hub disconnects Google right after the handshake, so Google");
+    console.error("sign-in is asked on EVERY login by design - what persists is the UNNES");
+    console.error("session above (verify: unnes status). To also keep a Google account in");
+    console.error("this profile's toolbar, add it to Chrome itself once (profile menu).");
     await cleanup();
     return { contract: 1, ok: true, mode: "browser", landingUrl, capturedCookies: captured };
   } catch (err) {
