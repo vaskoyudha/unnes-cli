@@ -92,6 +92,11 @@ export class CookieJar {
     return this.cookies.map((c) => ({ ...c }));
   }
 
+  /** Public snapshot of all cookies (for injecting into a browser context). */
+  all(): StoredCookie[] {
+    return this.cookies.map((c) => ({ ...c }));
+  }
+
   /** Restore a snapshot taken by snapshot(), dropping later additions. */
   restore(snap: StoredCookie[]): void {
     this.cookies = snap.map((c) => ({ ...c }));

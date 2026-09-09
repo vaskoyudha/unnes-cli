@@ -484,6 +484,43 @@ async function launchContext(browserDir: string, headless = true): Promise<unkno
   throw new Error("could not launch context after 4 attempts (profile locked)");
 }
 
+/** Copy every *.unnes.ac.id cookie from the jar into the browser context.
+ * The persistent profile's own gateway cookies are short-lived; the jar holds
+ * the freshest session (re-saved after every op). Without this injection,
+ * headless renders navigate with a stale profile and bounce to /login even
+ * though `unnes status` reports VALID. */
+async function loadJarIntoContext(jarPath: string, ctx: unknown): Promise<number> {
+  let n = 0;
+  let cookies: Array<{ name: string; value: string; domain: string; path: string; secure: boolean; httpOnly: boolean; expires: number | null }> = [];
+  try {
+    const parsed = JSON.parse(await import("node:fs/promises").then((fs) => fs.readFile(jarPath, "utf8"))) as { cookies?: typeof cookies };
+    cookies = parsed.cookies ?? [];
+  } catch { /* no jar yet — first login */ }
+  // NOTE: use the RAW file, not CookieJar.load — load() drops expired entries,
+  // but the server-side session may still be alive (see expiry clamp below).
+  for (const c of cookies) {
+    if (!c.domain.endsWith("unnes.ac.id")) continue;
+    const ck = {
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path || "/",
+      secure: c.secure ?? true,
+      httpOnly: c.httpOnly ?? false,
+    } as Record<string, unknown>;
+    // Chrome silently drops cookies with past expiry, but the server-side
+    // session often outlives the client-side timestamp (gateway sessions
+    // slide). Inject expired-looking ones as session cookies instead —
+    // after the op, syncJarFromContext re-captures fresh values + expiries.
+    if (c.expires && c.expires > Date.now()) ck.expires = c.expires / 1000;
+    try {
+      await (ctx as { addCookies(cs: unknown[]): Promise<void> }).addCookies([ck]);
+      n += 1;
+    } catch { /* malformed cookie — skip */ }
+  }
+  return n;
+}
+
 /** Copy every *.unnes.ac.id cookie from the browser context into the jar. */
 async function syncJarFromContext(ctx: unknown, jar: CookieJar): Promise<number> {
   const cookies = await (ctx as { cookies(): Promise<PlaywrightCookie[]> }).cookies();
@@ -545,6 +582,7 @@ export async function renderPage(jarPath: string, browserDir: string, opts: Rend
   let ctx: unknown;
   try {
     ctx = await launchContext(browserDir);
+    await loadJarIntoContext(jarPath, ctx);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ...base, error: { code: "usage", message: message } };
@@ -659,6 +697,7 @@ export async function crawlPage(jarPath: string, browserDir: string, opts: Crawl
   let ctx: unknown;
   try {
     ctx = await launchContext(browserDir);
+    await loadJarIntoContext(jarPath, ctx);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ...base, error: { code: "usage", message } };
@@ -835,6 +874,7 @@ export async function batchPages(
   let ctx: unknown;
   try {
     ctx = await launchContext(browserDir);
+    await loadJarIntoContext(jarPath, ctx);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return fail("usage", message);
@@ -1228,6 +1268,7 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
   let ctx: unknown;
   try {
     ctx = await launchContext(browserDir);
+    await loadJarIntoContext(jarPath, ctx);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ...base, error: { code: "usage", message } };
@@ -1465,6 +1506,7 @@ export async function openInProfileBrowser(jarPath: string, browserDir: string, 
   let ctx: unknown;
   try {
     ctx = await launchContext(browserDir, false); // HEADED so the user sees it
+    await loadJarIntoContext(jarPath, ctx);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ...base, error: { code: "usage", message } };
