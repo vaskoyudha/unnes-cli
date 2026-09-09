@@ -915,7 +915,20 @@ fn cmd_tugas_submit(home: &UnnesHome, profile: &str, cmid: u32, file: &str, fina
     job["action"] = json!(if finalize { "submit" } else { "draft" });
     job["ssoApp"] = json!("30");
     job["semester"] = json!(tugas::configured_elena_semester(home).unwrap_or_else(|| "20261".into()));
-    let res = fetcher::run_job(home, profile, job)?;
+    let mut res = fetcher::run_job(home, profile, job.clone())?;
+    // Self-healing submit: expired session -> auto re-login (scripted with the
+    // saved profile; escalates to a one-click window only if Google insists on
+    // a human) -> one retry. Same pattern as the fetch path.
+    if !res.ok && res.session_expired {
+        if let Ok(cfg) = Config::load(home) {
+            if cfg.general.auto_relogin {
+                eprintln!("session expired; auto re-login...");
+                if watch::auto_login(home, profile, true).is_ok() {
+                    res = fetcher::run_job(home, profile, job)?;
+                }
+            }
+        }
+    }
     if !res.ok {
         let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
         return Err(app_err(err_code_for(&code), format!("submit: {}", err_msg(&res))));
