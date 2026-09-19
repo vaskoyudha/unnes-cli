@@ -6,6 +6,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::cache;
 use crate::fetcher;
 use crate::paths::UnnesHome;
 use crate::tugas;
@@ -70,6 +71,54 @@ fn course_urls(kursus: &[u32]) -> Vec<(String, Value)> {
         .collect()
 }
 
+/// Fold one entry's extracted records into items (pure: no I/O).
+fn merge_records(
+    items: &mut Vec<MateriItem>,
+    seen: &mut std::collections::HashSet<String>,
+    records: &[Value],
+    cid: u32,
+) {
+    for rec in records {
+        let url = rec.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let kind = kind_of(&url);
+        if !is_materi_kind(&kind) || !seen.insert(url.clone()) {
+            continue;
+        }
+        let nama = rec.get("nama").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let nama = clean_nama(&nama);
+        if nama.is_empty() {
+            continue;
+        }
+        items.push(MateriItem {
+            course: format!("course-{cid}"),
+            course_id: cid,
+            nama,
+            url,
+            kind,
+        });
+    }
+}
+
+/// Fold previously cached items for one course into the result (pure).
+/// Used on HTTP 304: the portal confirms the course page is unchanged, so
+/// the cached records stand without re-parsing a (nonexistent) body.
+/// Returns the number of items merged.
+fn merge_cached(
+    items: &mut Vec<MateriItem>,
+    seen: &mut std::collections::HashSet<String>,
+    cached: &[MateriItem],
+    cid: u32,
+) -> usize {
+    let mut n = 0;
+    for it in cached.iter().filter(|it| it.course_id == cid) {
+        if seen.insert(it.url.clone()) {
+            items.push(it.clone());
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Collect every material link across every stored course: one batchget op
 /// (one node spawn, one jar) instead of one spawn per course page.
 pub fn fetch_materi(home: &UnnesHome, profile: &str, interactive: bool) -> Result<Vec<MateriItem>> {
@@ -100,7 +149,17 @@ pub fn fetch_materi(home: &UnnesHome, profile: &str, interactive: bool) -> Resul
             Vec::new()
         }
     };
+    // Previous full result for 304-as-cache-hit merges (TUI-warmed caches
+    // make CLI 304s useful too; empty when never cached).
+    let cached_items: Vec<MateriItem> = cache::load_any(home, "materi").unwrap_or_default();
     for (entry, cid) in results.iter().zip(kursus.iter()) {
+        if entry.ok && entry.not_modified {
+            // 304: serve this course from the previous cache instead of an
+            // empty body. Counts as a successful course like any other.
+            ok_courses += 1;
+            merge_cached(&mut items, &mut seen, &cached_items, *cid);
+            continue;
+        }
         if !(entry.ok && !entry.session_expired) {
             // One flaky course must not kill the whole list (and must
             // never trigger a browser prime - only session expiry does).
@@ -111,25 +170,7 @@ pub fn fetch_materi(home: &UnnesHome, profile: &str, interactive: bool) -> Resul
             continue;
         }
         ok_courses += 1;
-        for rec in &entry.records {
-            let url = rec.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let kind = kind_of(&url);
-            if !is_materi_kind(&kind) || !seen.insert(url.clone()) {
-                continue;
-            }
-            let nama = rec.get("nama").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let nama = clean_nama(&nama);
-            if nama.is_empty() {
-                continue;
-            }
-            items.push(MateriItem {
-                course: format!("course-{cid}"),
-                course_id: *cid,
-                nama,
-                url,
-                kind,
-            });
-        }
+        merge_records(&mut items, &mut seen, &entry.records, *cid);
     }
     if ok_courses == 0 {
         bail!("elena session unavailable; run: unnes login");
@@ -198,6 +239,22 @@ pub fn download_materi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_cached_serves_304_courses_without_reparse() {
+        let cached = vec![
+            MateriItem { course: "Kripto".into(), course_id: 7, nama: "slide.pdf".into(), url: "https://elena.unnes.ac.id/mod/resource/view.php?id=9".into(), kind: "resource".into() },
+            MateriItem { course: "Jarkom".into(), course_id: 8, nama: "bab1.pdf".into(), url: "https://elena.unnes.ac.id/mod/resource/view.php?id=10".into(), kind: "resource".into() },
+        ];
+        let mut items = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        // other course's items never leak in
+        assert_eq!(merge_cached(&mut items, &mut seen, &cached, 8), 1);
+        assert_eq!(items[0].nama, "bab1.pdf");
+        // second merge of the same course dedups via seen
+        assert_eq!(merge_cached(&mut items, &mut seen, &cached, 8), 0);
+        assert_eq!(items.len(), 1);
+    }
 
     #[test]
     fn course_urls_builds_one_entry_per_course() {

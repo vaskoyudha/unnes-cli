@@ -85,6 +85,18 @@ function startServer() {
       res.end();
       return;
     }
+    if (url.pathname === "/etag-page") {
+      // conditional-request shape: versioned body, honors If-None-Match
+      if (req.headers["if-none-match"] === '"v1"') {
+        res.statusCode = 304;
+        res.end();
+        return;
+      }
+      res.setHeader("etag", '"v1"');
+      res.setHeader("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT");
+      res.end("<html><body>version one</body></html>");
+      return;
+    }
     if (url.pathname === "/flaky-429") {
       // rate-limit shape: first hit 429 with Retry-After, then fine
       hits429 += 1;
@@ -684,5 +696,20 @@ test("batchget serves N urls in one spawn, one jar save", async (t) => {
     const { CookieJar } = await import("../dist/cookiejar.js");
     const jar = await CookieJar.load(join(home, "profiles", "default.json"));
     assert.ok(jar.cookieNames().length >= 0);
+  });
+});
+
+test("etag validators turn a repeat fetch into 304 notModified", async (t) => {
+  const { server, base } = await startServer();
+  t.after(() => new Promise((res) => server.close(res)));
+  await withHome("etag304", async () => {
+    const first = await processJob({ contract: 1, op: "get", url: base + "/etag-page" });
+    assert.equal(first.ok, true);
+    assert.equal(first.status, 200);
+    assert.ok(first.normalized.includes("version one"));
+    const second = await processJob({ contract: 1, op: "get", url: base + "/etag-page" });
+    assert.equal(second.ok, true);
+    assert.equal(second.notModified, true);
+    assert.equal(second.status, 304);
   });
 });

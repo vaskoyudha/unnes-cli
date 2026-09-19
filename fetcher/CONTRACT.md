@@ -84,6 +84,13 @@ network | timeout | ratelimit | csrf | login | usage | contract | internal.
   bootstrap with jar reload before retry. Top-level `ok` means the op ran;
   per-URL success lives on `results[]`; top `sessionExpired` is true when
   ANY entry expired (callers reuse the prime-then-retry path).
+- Conditional requests: the fetcher keeps per-URL validators
+  (`<profile>.validators.json` beside the jar: `{etag, lastModified}`),
+  sends If-None-Match/If-Modified-Since, and reports HTTP 304 as
+  `notModified: true` with no body (callers serve their cache instead of
+  re-parsing). A 1s-floor politeness limiter was measured slower than the
+  status quo for bursty runs (7.7s vs 3.5s), so the default floor is 0 with
+  Retry-After/backoff always on.
 - op=page: render a JS-driven page (Livewire) in the persistent browser session
   and extract records; op=crawl: follow link_selector from a start page and
   extract pageExtract rows per linked page (adds _source/_title). Both sync

@@ -152,6 +152,11 @@ pub struct JobResult {
     /// op=submit: human-readable outcome
     pub message: Option<String>,
     pub error: Option<JobError>,
+    /// op=get/batchget: HTTP 304, the caller's cached copy is still current.
+    /// Read by batchget consumers via BatchGetEntry; kept here for contract
+    /// parity on op=get results.
+    #[serde(default)]
+    pub not_modified: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -199,6 +204,9 @@ pub struct BatchGetEntry {
     pub records: Vec<Value>,
     pub normalized: Option<String>,
     pub error: Option<JobError>,
+    /// HTTP 304 for this URL: serve the cached items, don't re-parse.
+    #[serde(default)]
+    pub not_modified: bool,
 }
 
 /// Result of op=batchget: N plain-HTTP GETs served by one node spawn

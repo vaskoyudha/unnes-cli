@@ -3,6 +3,7 @@ import { pathToFileURL } from "node:url";
 import { CookieJar } from "./cookiejar.js";
 import { HttpFetcher } from "./http.js";
 import { PoliteLimiter } from "./polite.js";
+import { loadValidators, saveValidators } from "./validators.js";
 import { LoginForm, opLogin, opLogout } from "./login.js";
 import { normalizeHtml } from "./normalize.js";
 import { ExtractSpec, extractRecords } from "./extract.js";
@@ -121,20 +122,25 @@ export async function processJob(job: Job): Promise<JobResult> {
       if (!job.url) return fail("usage", "op=get requires url");
       const doGet = async (): Promise<JobResult> => {
         const jar = await CookieJar.load(profilePath);
-        const f = new HttpFetcher(jar, ua);
+        const store = await loadValidators(profilePath);
+        const f = new HttpFetcher(jar, ua, undefined, undefined, store);
         const res = await f.request({ method: "GET", url: job.url! });
         if (res.fetchError) return fail(res.fetchError.code, res.fetchError.message);
         // Persist slides/rotations from plain HTTP too (previously only
         // browser/sso paths saved, so sliding sessions looked expired early).
         // Skipped on expiry: the jar was rolled back to pre-request state and
-        // saving would only rewrite it.
-        if (!res.sessionExpired) await jar.save(profilePath);
+        // saving would only rewrite it. Validators ride along (a bounced
+        // login page carries no usable validators for the requested URL).
+        if (!res.sessionExpired) {
+          await jar.save(profilePath);
+          await saveValidators(profilePath, store);
+        }
         const records = job.extract ? extractRecords(res.html, job.extract) : [];
         const normalized = normalizeHtml(res.html, job.extraRegexes ?? []);
         return {
           contract: CONTRACT, op: "get", ok: true, status: res.status, finalUrl: res.finalUrl,
           sessionExpired: res.sessionExpired, challenge: res.challenge, retryAfter: res.retryAfter,
-          records, normalized,
+          notModified: res.notModified, records, normalized,
         };
       };
       let result = await doGet();
@@ -174,7 +180,9 @@ export async function processJob(job: Job): Promise<JobResult> {
       // price of one node spawn, with keep-alive reuse inside the process.
       const polite = new PoliteLimiter();
       let jar = await CookieJar.load(profilePath);
-      let f = new HttpFetcher(jar, ua, undefined, polite);
+      const store = await loadValidators(profilePath);
+      const newFetcher = () => new HttpFetcher(jar, ua, undefined, polite, store);
+      let f = newFetcher();
       const runGet = async (entry: { url: string; extract?: ExtractSpec; extraRegexes?: string[] }): Promise<JobResult> => {
         const res = await f.request({ method: "GET", url: entry.url });
         if (res.fetchError) return { url: entry.url, ok: false, error: { code: res.fetchError.code, message: res.fetchError.message } };
@@ -183,7 +191,7 @@ export async function processJob(job: Job): Promise<JobResult> {
         return {
           url: entry.url, ok: true, status: res.status, finalUrl: res.finalUrl,
           sessionExpired: res.sessionExpired, challenge: res.challenge, retryAfter: res.retryAfter,
-          records, normalized,
+          notModified: res.notModified, records, normalized,
         };
       };
       const { appForHost } = await import("./sso.js");
@@ -200,7 +208,7 @@ export async function processJob(job: Job): Promise<JobResult> {
               const refreshed = await refreshAppSession(profilePath, baseUrl, cfg.appId);
               if (refreshed.ok) {
                 jar = await CookieJar.load(profilePath);
-                f = new HttpFetcher(jar, ua, undefined, polite);
+                f = newFetcher();
                 r = await runGet(entry);
                 if (r.ok && r.sessionExpired !== true) {
                   (r as Record<string, unknown>).ssoRefreshed = true;
@@ -221,6 +229,7 @@ export async function processJob(job: Job): Promise<JobResult> {
       // (the jar was rolled back to pre-request state; saving rewrites it).
       if (results.some((r) => r.ok === true && (r as Record<string, unknown>).sessionExpired !== true)) {
         await jar.save(profilePath);
+        await saveValidators(profilePath, store);
       }
       return {
         contract: CONTRACT, op: "batchget", ok: true,

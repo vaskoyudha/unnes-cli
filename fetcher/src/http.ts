@@ -1,5 +1,7 @@
 import { CookieJar } from "./cookiejar.js";
 import type { PoliteLimiter } from "./polite.js";
+import type { UrlValidators } from "./validators.js";
+import { applyValidators, captureValidators } from "./validators.js";
 
 export interface HttpResult {
   status: number;
@@ -10,6 +12,8 @@ export interface HttpResult {
   retryAfter: number | null;
   challenge: boolean;
   sessionExpired: boolean;
+  /** HTTP 304: the caller's cached copy is still current (no body) */
+  notModified: boolean;
   fetchError: { code: string; message: string } | null;
 }
 
@@ -86,6 +90,7 @@ export class HttpFetcher {
     private userAgent: string,
     private timeoutMs = 30000,
     private polite?: PoliteLimiter,
+    private validators?: Record<string, UrlValidators>,
   ) {}
 
   /**
@@ -141,6 +146,7 @@ export class HttpFetcher {
       }
       const jarHeader = this.jar.headerFor(url);
       if (jarHeader) headers["cookie"] = jarHeader;
+      if (this.validators) applyValidators(headers, opts.url, this.validators);
 
       let res: Response;
       try {
@@ -162,12 +168,29 @@ export class HttpFetcher {
           retryAfter: null,
           challenge: false,
           sessionExpired: false,
+          notModified: false,
           fetchError: { code, message },
         };
       }
 
       const setCookie = this.collectSetCookie(res);
       this.jar.addFromSetCookie(setCookie, new URL(res.url));
+
+      // 304: our cached copy is still current. No body, no session signal,
+      // no validator recapture - the caller serves its cache instead.
+      if (res.status === 304) {
+        return {
+          status: res.status,
+          finalUrl: res.url,
+          html: "",
+          setCookie: [],
+          retryAfter: null,
+          challenge: false,
+          sessionExpired: false,
+          notModified: true,
+          fetchError: null,
+        };
+      }
 
       // Rate limit: sleep Retry-After (capped) and retry the same hop once.
       // Login-style POSTs tolerate one same-hop retry; the alternative
@@ -192,6 +215,7 @@ export class HttpFetcher {
           retryAfter: Number.isFinite(ra2) ? ra2 : null,
           challenge: false,
           sessionExpired: false,
+          notModified: false,
           fetchError: { code: "ratelimit", message: "HTTP 429 for " + url.href },
         };
       }
@@ -210,6 +234,9 @@ export class HttpFetcher {
         }
         url = new URL(loc!, res.url);
         continue;
+      }
+      if (this.validators && res.status === 200) {
+        captureValidators(opts.url, res, this.validators);
       }
 
       const html = await res.text();
@@ -248,6 +275,7 @@ export class HttpFetcher {
         retryAfter,
         challenge,
         sessionExpired,
+        notModified: false,
         fetchError: null,
       };
     }
