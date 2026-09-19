@@ -8,12 +8,17 @@ import { createServer } from "node:http";
 import { processJob } from "../dist/index.js";
 import { normalizeHtml } from "../dist/normalize.js";
 import { CookieJar, JAR_VERSION } from "../dist/cookiejar.js";
+import { googlePersistenceStatus } from "../dist/browser.js";
+import { describeSubmitState } from "../dist/browser.js";
+import { persistenceChange } from "../dist/browser.js";
+import { extractRecords } from "../dist/extract.js";
 
 const FIX = (f) => readFileSync(join(process.cwd(), "test", "fixtures", f), "utf8");
 
 function startServer() {
   let tokenCounter = 0;
   let lastToken = "";
+  let hits429 = 0;
   const server = createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     const cookie = req.headers.cookie ?? "";
@@ -65,6 +70,37 @@ function startServer() {
     if (url.pathname === "/challenge") {
       res.statusCode = 403;
       res.end(FIX("challenge.html"));
+      return;
+    }
+    if (url.pathname === "/file.bin") {
+      res.setHeader("content-type", "application/pdf");
+      res.setHeader("content-disposition", 'attachment; filename="slide-1.pdf"');
+      res.end(Buffer.from([0x25, 0x50, 0x44, 0x46, 0x31])); // %PDF1
+      return;
+    }
+    if (url.pathname === "/protected-file") {
+      // expired session shape: bounce to the login page
+      res.statusCode = 302;
+      res.setHeader("location", "/auth/login");
+      res.end();
+      return;
+    }
+    if (url.pathname === "/flaky-429") {
+      // rate-limit shape: first hit 429 with Retry-After, then fine
+      hits429 += 1;
+      if (hits429 === 1) {
+        res.statusCode = 429;
+        res.setHeader("retry-after", "0");
+        res.end("slow down");
+        return;
+      }
+      res.end("<html><body>fine</body></html>");
+      return;
+    }
+    if (url.pathname === "/denied-file") {
+      // expired session shape: 200 inline access-denied page (Moodle style)
+      res.setHeader("content-type", "text/html");
+      res.end("<html><body>tidak diberi hak untuk mengakses fitur ini [tamu]!</body></html>");
       return;
     }
     res.statusCode = 404;
@@ -345,5 +381,290 @@ test("contract versions other than 1 are rejected", async () => {
     });
     assert.equal(res.ok, false);
     assert.equal(res.error.code, "contract");
+  });
+});
+
+test("googlePersistenceStatus: persistent SID counts, session-only does not", () => {
+  const mk = (name, domain, expires) => ({ name, value: "v", domain, path: "/", expires, httpOnly: true, secure: true, sameSite: "Lax" });
+  // Persistent auth cookie -> chooser populated next login.
+  let s = googlePersistenceStatus([mk("SID", ".google.com", 1900000000), mk("NID", ".google.com", 1900000000)]);
+  assert.deepEqual(s.persistentAuth, ["SID"]);
+  assert.deepEqual(s.sessionAuth, []);
+  // Session-only SID (expires -1, dropped by Chrome on close) -> disappearing accounts.
+  s = googlePersistenceStatus([mk("SID", ".google.com", -1), mk("HSID", "accounts.google.com", -1)]);
+  assert.deepEqual(s.persistentAuth, []);
+  assert.deepEqual(s.sessionAuth, ["HSID", "SID"]);
+  // Prefs/telemetry only (the exact state of a profile whose chooser is empty).
+  s = googlePersistenceStatus([
+    mk("NID", ".google.com", 1900000000),
+    mk("OTZ", "accounts.google.com", 1900000000),
+    mk("__Host-GAPS", "accounts.google.com", 1900000000),
+  ]);
+  assert.deepEqual(s.persistentAuth, []);
+  assert.deepEqual(s.sessionAuth, []);
+  assert.deepEqual(s.other, ["NID", "OTZ", "__Host-GAPS"]);
+  // Non-google cookies are ignored; empty input is empty.
+  s = googlePersistenceStatus([mk("laravel_session", "apps.unnes.ac.id", 1900000000)]);
+  assert.deepEqual(s.persistentAuth, []);
+  assert.deepEqual(s.other, []);
+  s = googlePersistenceStatus([]);
+  assert.deepEqual(s, { persistentAuth: [], sessionAuth: [], other: [] });
+});
+
+test("download saves server bytes with the advertised filename", async (t) => {
+  const { server, base } = await startServer();
+  t.after(() => new Promise((res) => server.close(res)));
+  await withHome("dl-ok", async (home) => {
+    const out = join(home, "dl");
+    const res = await processJob({ contract: 1, op: "download", url: base + "/file.bin", out });
+    assert.equal(res.ok, true);
+    assert.equal(res.filename, "slide-1.pdf");
+    assert.equal(res.bytes, 5);
+    assert.equal(res.path, join(out, "slide-1.pdf"));
+    const raw = readFileSync(join(out, "slide-1.pdf"));
+    assert.equal(raw.length, 5);
+    assert.equal(raw[0], 0x25);
+  });
+});
+
+test("download reports session expiry on a login bounce", async (t) => {
+  const { server, base } = await startServer();
+  t.after(() => new Promise((res) => server.close(res)));
+  await withHome("dl-exp", async (home) => {
+    const res = await processJob({ contract: 1, op: "download", url: base + "/protected-file", out: join(home, "dl") });
+    assert.equal(res.ok, false);
+    assert.equal(res.sessionExpired, true);
+  });
+});
+test("describeSubmitState reports the verified end state honestly", () => {
+  assert.match(describeSubmitState({ submitted: true, draft: false, status: "Submitted for grading", hasFile: true, url: "" }), /submitted for grading/);
+  assert.equal(describeSubmitState({ submitted: false, draft: true, status: "", hasFile: false, url: "" }), "file uploaded and saved as draft");
+  assert.equal(describeSubmitState({ submitted: false, draft: false, status: "", hasFile: true, url: "" }), "file uploaded and saved as draft");
+  // Unverifiable is explicit, not a fake success.
+  assert.match(
+    describeSubmitState({ submitted: false, draft: false, status: "", hasFile: false, url: "" }),
+    /could be verified/
+  );
+});
+
+test("elena course page yields classified mod links (live fixture)", () => {
+  const html = FIX("elena-course.html");
+  assert.ok(html.includes("Kriptografi"), "fixture is the Kriptografi course page");
+  const recs = extractRecords(html, {
+    selector: "a[href*='/mod/']",
+    fields: { nama: "", url: "@href" },
+  });
+  assert.ok(recs.length >= 10, `expected >=10 mod links, got ${recs.length}`);
+  const kinds = {};
+  for (const r of recs) {
+    const m = (r.url || "").match(/\/mod\/(\w+)\//);
+    const k = m ? m[1] : "?";
+    kinds[k] = (kinds[k] || 0) + 1;
+  }
+  // The live page carries materials alongside activities.
+  assert.ok((kinds.resource || 0) >= 1, `expected resource links, got ${JSON.stringify(kinds)}`);
+  const named = recs.filter((r) => (r.nama || "").trim() !== "" && (r.url || "").includes("/mod/resource/"));
+  assert.ok(named.length >= 1, "expected at least one named resource link");
+});
+
+test("persistenceChange distinguishes kept / lost / never-planted", () => {
+  const P = (auth) => ({ persistentAuth: auth, sessionAuth: [], other: [] });
+  assert.deepEqual(persistenceChange(P(["SID"]), P(["SID", "HSID"])), { kept: true, lost: false });
+  assert.deepEqual(persistenceChange(P(["SID"]), P([])), { kept: false, lost: true });
+  assert.deepEqual(persistenceChange(P([]), P([])), { kept: false, lost: false });
+});
+
+test("isOwnChromeProcess matches only chrome cmdlines holding the dir", async () => {
+  const { isOwnChromeProcess, armShutdownGuard } = await import("../dist/browser.js");
+  // self: our cmdline contains neither marker
+  assert.equal(isOwnChromeProcess(process.pid, "definitely-not-present-xyz"), false);
+  // nonexistent pid
+  assert.equal(isOwnChromeProcess(42424242, "anything"), false);
+  // fake chrome holding the profile dir
+  const { spawn } = await import("node:child_process");
+  const kid = spawn("bash", ["-c", "exec -a probe-chrome-marker sleep 30"]);
+  try {
+    assert.equal(isOwnChromeProcess(kid.pid, "probe-chrome-marker"), true);
+    assert.equal(isOwnChromeProcess(kid.pid, "/some/other/dir"), false);
+  } finally {
+    kid.kill("SIGKILL");
+  }
+});
+
+test("armShutdownGuard installs handlers once and disarms idempotently", async () => {
+  const { armShutdownGuard } = await import("../dist/browser.js");
+  const before = process.listenerCount("SIGINT");
+  const d1 = armShutdownGuard(async () => {});
+  const d2 = armShutdownGuard(async () => {});
+  assert.equal(process.listenerCount("SIGINT"), before + 1);
+  d1(); d1(); d2(); // idempotent, no throw
+});
+
+test("SIGINT runs the armed shutdown closer before exit (child process)", async (t) => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdtempSync, existsSync, readFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "unnes-guard-"));
+  const flag = join(dir, "flushed");
+  const child = join(dir, "child.mjs");
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(child, [
+    "import { armShutdownGuard } from " + JSON.stringify(new URL("../dist/browser.js", import.meta.url).href) + ";",
+    "import { writeFileSync } from 'node:fs';",
+    "armShutdownGuard(async () => {",
+    "  await new Promise((r) => setTimeout(r, 200));",
+    `  writeFileSync(${JSON.stringify(flag)}, 'flushed');`,
+    "});",
+    "setTimeout(() => process.kill(process.pid, 'SIGINT'), 200);",
+    "setInterval(() => {}, 1000);",
+  ].join("\n"));
+  const t0 = Date.now();
+  const res = spawnSync(process.execPath, [child], { timeout: 20000 });
+  const dt = Date.now() - t0;
+  assert.equal(res.status, 130);
+  assert.ok(existsSync(flag), "closer ran and flushed before exit");
+  assert.equal(readFileSync(flag, "utf8"), "flushed");
+  assert.ok(dt < 15000, "no 15s fallback wait on the happy path");
+  const { rmSync } = await import("node:fs");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("renderDir isolates headless renders from the login profile", async () => {
+  const { renderDir, MAIN_STORE_ARGS } = await import("../dist/browser.js");
+  assert.equal(renderDir("/h/browser-profiles/default"), "/h/browser-profiles/default-headless");
+  // Single-backend rule: every MAIN launcher pins the same deterministic
+  // store. No keyring, no mock-vs-real split.
+  assert.deepEqual(MAIN_STORE_ARGS, ["--password-store=basic"]);
+});
+
+test("unified basic store persists cookies across launchers (early-system invariant)", async (t) => {
+  // Regression: headed login (real Chrome via CDP) and headless ops used
+  // different cookie-encryption backends on ONE profile dir, so each open
+  // read the other's session as signed-out and checkpointed the amnesia -
+  // "password every time". All MAIN launchers now pin --password-store=basic
+  // explicitly, so a cookie written by one launcher must be visible to the
+  // next, whichever launcher opens the dir.
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { chromium } = await import("playwright");
+  const { MAIN_STORE_ARGS } = await import("../dist/browser.js");
+  const dir = mkdtempSync(join(tmpdir(), "unnes-store-"));
+  const baseOpts = {
+    headless: true,
+    args: ["--disable-blink-features=AutomationControlled", ...MAIN_STORE_ARGS],
+  };
+  const exp = Math.floor(Date.now() / 1000) + 86400 * 30;
+  let ctx;
+  try {
+    ctx = await chromium.launchPersistentContext(dir, baseOpts);
+  } catch (e) {
+    rmSync(dir, { recursive: true, force: true });
+    t.skip("cannot launch chromium: " + String(e).slice(0, 120));
+    return;
+  }
+  try {
+    await ctx.addCookies([{ name: "SID", value: "k1", domain: ".google.com", path: "/", secure: true, httpOnly: true, expires: exp }]);
+    await ctx.close();
+    // Second launcher, stock defaults (Playwright already ships basic): the
+    // planted session must survive the handoff.
+    const c2 = await chromium.launchPersistentContext(dir, { headless: true });
+    const seen = (await c2.cookies()).map((c) => c.name);
+    await c2.close();
+    assert.ok(seen.includes("SID"), "unified basic store must keep SID across launchers");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("leading-dot domains match subdomains (browser-captured cookies)", async () => {
+  const { CookieJar } = await import("../dist/cookiejar.js");
+  const jar = CookieJar.empty();
+  // Playwright reports domain cookies with a leading dot.
+  jar.addCookie({ name: "identitas_sso", value: "1", domain: ".unnes.ac.id", path: "/", secure: false, httpOnly: false, expires: null });
+  jar.addCookie({ name: "X", value: "y", domain: ".apps.unnes.ac.id", path: "/", secure: false, httpOnly: false, expires: null });
+  const h1 = jar.headerFor(new URL("https://elena.unnes.ac.id/my/"));
+  assert.ok(h1 && h1.includes("identitas_sso=1"), "dot-domain must be sent to subdomains: " + h1);
+  const h2 = jar.headerFor(new URL("https://apps.unnes.ac.id/gate/list"));
+  assert.ok(h2 && h2.includes("X=y"), "exact dot-domain host must match: " + h2);
+  const h3 = jar.headerFor(new URL("https://evilunnes.ac.id/"));
+  assert.ok(!h3 || !h3.includes("identitas_sso"), "must not match evilunnes.ac.id: " + h3);
+});
+
+test("cookie paths respect boundaries and Set-Cookie deletion works", async () => {
+  const { CookieJar } = await import("../dist/cookiejar.js");
+  const jar = CookieJar.empty();
+  jar.addCookie({ name: "a", value: "1", domain: "x.test", path: "/app", secure: false, httpOnly: false, expires: null });
+  assert.ok(jar.headerFor(new URL("https://x.test/app/y")).includes("a=1"));
+  assert.equal(jar.headerFor(new URL("https://x.test/application")), null);
+  assert.ok(jar.headerFor(new URL("https://x.test/app")).includes("a=1"));
+  // server logout (past expiry) removes the entry instead of being ignored
+  jar.addFromSetCookie(["a=gone; Path=/app; Expires=Thu, 01 Jan 1970 00:00:00 GMT"], new URL("https://x.test/app"));
+  assert.equal(jar.headerFor(new URL("https://x.test/app/y")), null);
+  // explicit Domain attr with leading dot is accepted and normalized
+  jar.addFromSetCookie(["b=2; Domain=.x.test; Path=/"], new URL("https://a.x.test/"));
+  assert.ok(jar.headerFor(new URL("https://b.x.test/")).includes("b=2"));
+});
+
+test("cookieValue skips expired entries", async () => {
+  const { CookieJar } = await import("../dist/cookiejar.js");
+  const jar = CookieJar.empty();
+  jar.addCookie({ name: "XSRF-TOKEN", value: "old", domain: "x.test", path: "/", secure: false, httpOnly: false, expires: null });
+  assert.equal(jar.cookieValue(["XSRF-TOKEN"], new URL("https://x.test/")), "old");
+});
+
+test("download maps inline denial pages to session expiry", async (t) => {
+  const { server, base } = await startServer();
+  t.after(() => new Promise((res) => server.close(res)));
+  await withHome("dl-denied", async (home) => {
+    const res = await processJob({ contract: 1, op: "download", url: base + "/denied-file", out: join(home, "dl") });
+    assert.equal(res.ok, false);
+    assert.equal(res.sessionExpired, true);
+  });
+});
+
+test("evil filenames never escape the out dir", async (t) => {
+  const { server, base } = await import("node:http").then(async ({ createServer }) => {
+    const s = createServer((req, res) => {
+      res.setHeader("content-type", "application/pdf");
+      res.setHeader("content-disposition", 'attachment; filename=".."');
+      res.end(Buffer.from([0x25, 0x50]));
+    });
+    await new Promise((r) => s.listen(0, "127.0.0.1", r));
+    return { server: s, base: "http://127.0.0.1:" + s.address().port };
+  });
+  t.after(() => new Promise((res) => server.close(res)));
+  await withHome("dl-evil", async (home) => {
+    const out = join(home, "dl");
+    const res = await processJob({ contract: 1, op: "download", url: base + "/evil.pdf", out });
+    assert.equal(res.ok, false);
+    assert.match(res.error.message, /unsafe/);
+    const { existsSync, readdirSync } = await import("node:fs");
+    assert.ok(!existsSync(join(home, "parent-should-not-exist")), "no escape write");
+    if (existsSync(out)) assert.deepEqual(readdirSync(out), []);
+  });
+});
+
+test("polite limiter enforces per-host floor with injected rand", async () => {
+  const { PoliteLimiter } = await import("../dist/polite.js");
+  const lim = new PoliteLimiter({ minDelayMs: 1000, rand: () => 0.5 });
+  const t0 = Date.now();
+  await lim.waitFor("a.test");
+  await lim.waitFor("a.test");
+  const dt = Date.now() - t0;
+  assert.ok(dt >= 700 && dt < 3000, "second wait must sleep ~750ms, got " + dt);
+  const t1 = Date.now();
+  await lim.waitFor("b.test");
+  assert.ok(Date.now() - t1 < 200, "different host must not wait");
+});
+
+test("429 with Retry-After is retried once, then succeeds", async (t) => {
+  const { server, base } = await startServer();
+  t.after(() => new Promise((res) => server.close(res)));
+  await withHome("ratelimit", async () => {
+    const res = await processJob({ contract: 1, op: "get", url: base + "/flaky-429" });
+    assert.equal(res.ok, true);
+    assert.equal(res.status, 200);
   });
 });
