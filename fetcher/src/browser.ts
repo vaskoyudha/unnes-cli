@@ -18,9 +18,24 @@
 // chromium) and never needed for non-login operations.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, mkdirSync, existsSync, lstatSync, readlinkSync, unlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, existsSync, lstatSync, readlinkSync, unlinkSync, copyFileSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { CookieJar } from "./cookiejar.js";
+
+/** Best-effort pre-login backup of the Chromium cookie store, so a
+ * killed/crashed login run (torn SQLite WAL) can be recovered by hand.
+ * Returns the backup path, or null when there was nothing to back up. */
+function backupCookies(browserDir: string): string | null {
+  try {
+    const src = join(browserDir, "Default", "Cookies");
+    if (!existsSync(src)) return null;
+    const dst = join(browserDir, "Default", "Cookies.unnes-bak");
+    copyFileSync(src, dst);
+    return dst;
+  } catch {
+    return null;
+  }
+}
 
 function cleanStaleSingleton(browserDir: string): void {
   try {
@@ -33,10 +48,25 @@ function cleanStaleSingleton(browserDir: string): void {
         const match = target.match(/-(\d+)$/);
         if (match) {
           const pid = parseInt(match[1], 10);
+          let denied = false;
           try {
             process.kill(pid, 0);
-          } catch {
-            isDead = true;
+          } catch (e) {
+            // EPERM = a LIVE process we may not signal (different uid /
+            // hidepid): hands off entirely, never unlink a live browser's
+            // lock. Anything else (ESRCH...) = dead.
+            if ((e as NodeJS.ErrnoException)?.code === "EPERM") denied = true;
+            else isDead = true;
+          }
+          if (!denied && !isDead) {
+            // Alive own-uid holder. Reap ONLY when it is provably our own
+            // orphan AND no sibling unnes/fetcher process exists that could
+            // own it: murdering a concurrent run's browser mid-login was a
+            // real session killer (never adopt-or-kill a live sibling).
+            if (isOwnChromeProcess(pid, browserDir) && !hasLiveUnnesPeer()) {
+              reapOwnOrphan(browserDir, pid);
+              isDead = true;
+            }
           }
         } else {
           isDead = true;
@@ -53,17 +83,68 @@ function cleanStaleSingleton(browserDir: string): void {
   } catch { /* best effort */ }
 }
 
+/** True when another unnes CLI / fetcher process is alive besides this
+ * process tree: a live lock holder may be ITS browser, so reaping is
+ * forbidden - wait it out instead. Linux /proc scan, best effort
+ * (fail-open towards caution: unreadable => assume a peer exists). */
+function hasLiveUnnesPeer(): boolean {
+  try {
+    const me = new Set<number>([process.pid]);
+    try {
+      let ppid: number = process.ppid || 1;
+      for (let i = 0; i < 16 && ppid > 1; i++) {
+        me.add(ppid);
+        const parts: string[] = readFileSync(`/proc/${ppid}/stat`, "utf8").split(" ");
+        ppid = Number(parts[3]) || 1;
+      }
+    } catch { /* best effort */ }
+    // Match by program identity, not by repo path: an editor with the repo
+    // open must NOT count as a peer (that would permanently disable reaping).
+    // A peer is a node process running the fetcher, or an `unnes` binary.
+    const mine = ["dist/index.js"];
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      if (me.has(pid)) continue;
+      let cmd: string;
+      try {
+        cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+      } catch {
+        continue;
+      }
+      const argv0 = cmd.split(" ")[0];
+      const base = argv0.split("/").pop() ?? "";
+      if (base === "unnes") return true;
+      if (mine.some((m) => cmd.includes(m))) {
+        // Our own fetcher child could theoretically match: exclude direct
+        // children of this process (spawned by us, e.g. none - each op is one
+        // node process, but be strict anyway via ppid check below).
+        try {
+          const ppid = Number(readFileSync(`/proc/${pid}/stat`, "utf8").split(" ")[3]);
+          if (ppid === process.pid) continue;
+        } catch { /* fall through: count it */ }
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 function findChromeBinary(): string | null {
   if (process.env.CHROME_BIN && existsSync(process.env.CHROME_BIN)) return process.env.CHROME_BIN;
+  // $HOME-based first (portable across machines/users), then system paths.
+  const home = process.env.HOME ?? "";
   const candidates = [
-    "/home/vyns/.local/bin/google-chrome",
+    home ? home + "/.local/bin/google-chrome" : "",
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
   ];
   for (const c of candidates) {
-    if (existsSync(c)) return c;
+    if (c && existsSync(c)) return c;
   }
   return null;
 }
@@ -74,9 +155,174 @@ interface CDPChromeInstance {
   proc: ChildProcess;
 }
 
-async function launchCDPChrome(browserDir: string, headless: boolean, port = 9224): Promise<CDPChromeInstance | null> {
+function chromeLabel(): string {
+  // One line on stderr per launch so a future "accounts disappeared" report
+  // can rule out a binary flip (real Chrome vs bundled Chromium use different
+  // keyring keys, so a flip makes the stored Google cookies unreadable).
+  return findChromeBinary() ?? "(playwright bundled chromium)";
+}
+
+/** Wait for a spawned Chrome to exit after graceful close; SIGTERM it if it
+ * lingers (SIGTERM still shuts Chrome down gracefully with cookies intact),
+ * SIGKILL only as the last resort. Resolves true when the process is gone. */
+async function awaitChromeExit(proc: ChildProcess, gracefulWaitMs = 5000): Promise<boolean> {
+  const exited = await new Promise<boolean>((resolve) => {
+    if (proc.exitCode !== null) return resolve(true);
+    const t = setTimeout(() => resolve(false), gracefulWaitMs);
+    proc.once("exit", () => { clearTimeout(t); resolve(true); });
+  });
+  if (exited) return true;
+  try { proc.kill(); } catch { /* already gone */ }
+  const dead = await new Promise<boolean>((resolve) => {
+    if (proc.exitCode !== null) return resolve(true);
+    const t = setTimeout(() => resolve(false), 5000);
+    proc.once("exit", () => { clearTimeout(t); resolve(true); });
+  });
+  if (!dead) {
+    try { proc.kill("SIGKILL"); } catch { /* already gone */ }
+  }
+  return dead;
+}
+
+/** Every launcher touching the MAIN login profile must use the SAME cookie
+ * encryption backend, or Chrome reads the other launcher's cookies as
+ * undecryptable, treats the session as signed out, and checkpoints that
+ * amnesia to disk on close ("password every time").
+ *
+ * History: the early system used Playwright's bundled chromium everywhere
+ * (single backend: `--password-store=basic`), and one-click re-login worked.
+ * Switching headed login to the real Chrome binary (CDP, OS-keyring attempt)
+ * while headless ops kept Playwright's mock keychain on the SAME dir broke
+ * the invariant: alternating backends wiped the planted Google session.
+ * Stripping the mock flags (OS-keyring direction) was tried and did not hold
+ * on live profiles, so the rule is now the other way: pin the deterministic
+ * `basic` store EXPLICITLY on every MAIN launcher (CDP spawn args +
+ * Playwright `args`, never `ignoreDefaultArgs`). No keyring daemon, no lock
+ * state, same bytes whoever opens the profile. The 0700 dir permission stays
+ * the confidentiality boundary, as in the early system.
+ * Exported for unit tests. */
+export const MAIN_STORE_ARGS = ["--password-store=basic"];
+
+/** Legacy name kept for the compiled test import; same value as
+ * MAIN_STORE_ARGS. Do not reintroduce mock-keychain stripping on MAIN. */
+export const KEYRING_OVERRIDE_ARGS = ["--password-store=basic"];
+
+/** Headless render ops (page/crawl/batch/submit/open) never need the Google
+ * web session - they run on jar-injected unnes cookies. They get their OWN
+ * profile dir so no background renderer can ever meet (and burn or wipe)
+ * the login profile's planted Google session. This also ends headed-login
+ * vs background-render SingletonLock contention.
+ * Renderers keep Playwright's stock defaults on their own dir; only MAIN
+ * launchers must pin MAIN_STORE_ARGS. Exported for unit tests. */
+export function renderDir(browserDir: string): string {
+  return browserDir + "-headless";
+}
+
+/** True when `pid` is a Chrome process holding THIS profile dir (an orphan
+ * from a killed run). Linux-only check, best effort. Exported for tests. */
+export function isOwnChromeProcess(pid: number, browserDir: string): boolean {
+  try {
+    const cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+    return cmd.includes("chrome") && cmd.includes(browserDir);
+  } catch {
+    return false;
+  }
+}
+
+function reapOwnOrphan(browserDir: string, pid: number): void {
+  // A previous run died without cleanup (Ctrl+C / closed terminal / kill):
+  // its Chrome survived, still holding the profile lock AND unflushed
+  // cookies. Reap it gracefully so this run gets a clean profile.
+  // Called only after ownership + no-live-peer checks in cleanStaleSingleton,
+  // and re-verified before each lethal step (PID reuse must never hit an
+  // unrelated process).
+  const stillOurs = () => isOwnChromeProcess(pid, browserDir);
+  try {
+    if (!stillOurs()) return;
+    console.error(`[browser] reaping orphaned Chrome (pid ${pid}) from a previous run...`);
+    process.kill(pid, "SIGTERM");
+    const start = Date.now();
+    while (Date.now() - start < 5000) {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        break; // dead
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    }
+    try {
+      process.kill(pid, 0);
+      if (stillOurs()) process.kill(pid, "SIGKILL"); // refused to die gracefully
+    } catch { /* dead */ }
+  } catch { /* already gone */ }
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown guard: Ctrl+C / closed terminal / SIGTERM must NEVER nuke the
+// browser mid-write (torn cookie store = "Google session disappeared").
+// Browser ops arm the guard with their graceful closer; a signal runs it,
+// waits for the flush, then exits with the conventional code.
+// ---------------------------------------------------------------------------
+
+let activeShutdown: (() => Promise<void>) | null = null;
+let handlersInstalled = false;
+
+function ensureSignalHandlers(): void {
+  if (handlersInstalled) return;
+  handlersInstalled = true;
+  const shutdown = (sig: string, code: number) => {
+    const closer = activeShutdown;
+    activeShutdown = null;
+    if (!closer) {
+      process.exit(code);
+      return;
+    }
+    console.error(`[browser] ${sig} received - flushing browser profile before exit...`);
+    let done = false;
+    const finish = () => {
+      if (!done) {
+        done = true;
+        process.exit(code);
+      }
+    };
+    setTimeout(finish, 15000).unref?.();
+    Promise.resolve()
+      .then(() => closer())
+      .catch(() => {})
+      .then(finish);
+  };
+  process.on("SIGINT", () => shutdown("SIGINT", 130));
+  process.on("SIGTERM", () => shutdown("SIGTERM", 143));
+  process.on("SIGHUP", () => shutdown("SIGHUP", 129));
+}
+
+/** Arm the guard around a browser op; call the returned disarm in `finally`.
+ * Exported for unit tests (arm/disarm bookkeeping only). */
+export function armShutdownGuard(closer: () => Promise<void>): () => void {
+  ensureSignalHandlers();
+  activeShutdown = closer;
+  let cleared = false;
+  return () => {
+    if (!cleared) {
+      cleared = true;
+      if (activeShutdown === closer) activeShutdown = null;
+    }
+  };
+}
+
+async function launchCDPChrome(browserDir: string, headless: boolean, port = 0): Promise<CDPChromeInstance | null> {
+  // port 0 = the OS picks a free debugging port per spawn (discovered below
+  // via DevToolsActivePort). A FIXED port let two concurrent ops attach to
+  // each other's browser: the second Chrome delegates through SingletonLock
+  // and exits while the op happily drives (and closes!) the sibling's tabs.
   cleanStaleSingleton(browserDir);
+  // A stale DevToolsActivePort from a previous run must not be mistaken for
+  // ours (that would re-attach to a sibling): only a file written after this
+  // spawn counts.
+  const t0 = Date.now();
+  try { unlinkSync(join(browserDir, "DevToolsActivePort")); } catch { /* absent */ }
   const chromeBin = findChromeBinary();
+  console.error("[browser] launching " + (chromeBin ?? "(playwright bundled chromium)") + " on profile " + browserDir);
   if (!chromeBin) return null;
   try {
     mkdirSync(browserDir, { recursive: true });
@@ -89,34 +335,66 @@ async function launchCDPChrome(browserDir: string, headless: boolean, port = 922
     `--user-data-dir=${browserDir}`,
     "--no-first-run",
     "--no-default-browser-check",
+    // Pinned cookie store: every MAIN launcher must agree byte-for-byte
+    // (see MAIN_STORE_ARGS). Renders pass through here too, on their own
+    // dir, where the same flag is simply harmless determinism.
+    "--password-store=basic",
     "--disable-features=FedCm,CrossOriginOpenerPolicy",
     "--disable-blink-features=AutomationControlled",
     ...(headless ? ["--headless=new"] : []),
     "about:blank",
   ], { stdio: "ignore" });
 
+  // Discover OUR port: DevToolsActivePort is written by our own Chrome right
+  // after bind. A delegated/duplicate spawn exits without touching it.
+  let actualPort = port;
+  if (port === 0) {
+    for (let i = 0; i < 25; i++) {
+      if (proc.exitCode !== null) return null; // delegated to a lock holder; caller falls back
+      try {
+        const st = lstatSync(join(browserDir, "DevToolsActivePort"));
+        if (st.mtimeMs >= t0 - 1000) {
+          const n = Number(readFileSync(join(browserDir, "DevToolsActivePort"), "utf8").trim().split("\n")[0]);
+          if (Number.isInteger(n) && n > 0) {
+            actualPort = n;
+            break;
+          }
+        }
+      } catch { /* not written yet */ }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    if (actualPort === 0) {
+      try { proc.kill(); } catch { /* already gone */ }
+      return null;
+    }
+  }
+
   let connected = false;
   for (let i = 0; i < 25; i++) {
+    if (proc.exitCode !== null) return null; // lost the race; do not adopt a foreign browser
     await new Promise((r) => setTimeout(r, 400));
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/json/version`);
+      const res = await fetch(`http://127.0.0.1:${actualPort}/json/version`);
       if (res.ok) { connected = true; break; }
     } catch {}
   }
   if (!connected) {
-    proc.kill();
+    try { proc.kill(); } catch { /* already gone */ }
     return null;
   }
 
   try {
     const mod = (await import("playwright")) as unknown as { chromium?: { connectOverCDP: (u: string) => Promise<unknown> }; default?: { chromium?: { connectOverCDP: (u: string) => Promise<unknown> } } };
     const chromium = mod.chromium ?? mod.default?.chromium;
-    if (!chromium) { proc.kill(); return null; }
-    const browser = (await chromium.connectOverCDP(`http://127.0.0.1:${port}`)) as { close: () => Promise<void>; contexts: () => unknown[] };
+    if (!chromium) { try { proc.kill(); } catch { /* already gone */ } return null; }
+    const browser = (await chromium.connectOverCDP(`http://127.0.0.1:${actualPort}`)) as { close: () => Promise<void>; contexts: () => unknown[] };
     const ctx = browser.contexts()[0];
     return { browser, ctx, proc };
   } catch {
-    proc.kill();
+    // Failed to attach: never adopt a foreign debugger. Kill what we spawned
+    // (best effort) and let the caller fall back - a leaked proc here becomes
+    // the next run's "profile in use" orphan.
+    try { proc.kill(); } catch { /* already gone */ }
     return null;
   }
 }
@@ -128,6 +406,10 @@ export interface BrowserLoginResult {
   status?: number;
   landingUrl: string | null;
   capturedCookies: number;
+  /** persistent Google auth cookies kept (SID/SSID/HSID/SAPISID/APISID with a
+   * real expiry). 0 means the account chooser will be EMPTY on the next
+   * login - the web session was session-scoped and real Chrome dropped it. */
+  googlePersistent?: number;
   error?: { code: string; message: string };
   [k: string]: unknown;
 }
@@ -152,12 +434,77 @@ interface PlaywrightCookie {
   sameSite: "Strict" | "Lax" | "None";
 }
 
+// Google cookies that prove a PERSISTENT web sign-in (they survive a browser
+// restart and populate the account chooser): the SID family plus the account
+// chooser marker. NID/OTZ/GAPS are prefs/telemetry - they do NOT keep you
+// signed in on their own. Playwright reports session cookies with
+// expires === -1; real Chrome drops those on close, which is exactly the
+// "my Google accounts disappeared" symptom: the hub OAuth succeeded (so unnes
+// cookies exist and login looks fine) but nothing persistent was planted.
+// Exported for unit tests.
+const GOOGLE_AUTH_COOKIES = new Set(["SID", "SSID", "HSID", "SAPISID", "APISID", "ACCOUNT_CHOOSER"]);
+
+export interface GooglePersistence {
+  /** persistent auth cookies (chooser will list accounts next login) */
+  persistentAuth: string[];
+  /** auth cookies that die with the browser (chooser empty next login) */
+  sessionAuth: string[];
+  /** prefs/telemetry only (NID/OTZ/GAPS/...) - not a sign-in */
+  other: string[];
+}
+
+export function googlePersistenceStatus(all: PlaywrightCookie[]): GooglePersistence {
+  const persistentAuth = new Set<string>();
+  const sessionAuth = new Set<string>();
+  const other = new Set<string>();
+  for (const c of all) {
+    if (!c.domain.includes("google")) continue;
+    if (!GOOGLE_AUTH_COOKIES.has(c.name)) {
+      other.add(c.name);
+      continue;
+    }
+    if (c.expires === -1) sessionAuth.add(c.name);
+    else persistentAuth.add(c.name);
+  }
+  return {
+    persistentAuth: [...persistentAuth].sort(),
+    sessionAuth: [...sessionAuth].sort(),
+    other: [...other].sort(),
+  };
+}
+
+export interface PersistenceChange {
+  /** persistent auth survived this run */
+  kept: boolean;
+  /** persistent auth existed at open but is gone now (kill/crash/sign-out) */
+  lost: boolean;
+}
+
+/** Compare the pre-login baseline against the post-login state. Exported
+ * for unit tests. */
+export function persistenceChange(pre: GooglePersistence, post: GooglePersistence): PersistenceChange {
+  return {
+    kept: post.persistentAuth.length > 0,
+    lost: post.persistentAuth.length === 0 && pre.persistentAuth.length > 0,
+  };
+}
+
 export async function browserLogin(jarPath: string, browserDir: string, hubUrl: string = HUB_URL): Promise<BrowserLoginResult> {
   cleanStaleSingleton(browserDir);
-  const fail = (code: string, message: string): BrowserLoginResult => ({
-    contract: 1, ok: false, mode: "browser", landingUrl: null, capturedCookies: 0,
-    error: { code, message },
-  });
+  let disarmShutdown: () => void = () => {};
+  const fail = (code: string, message: string): BrowserLoginResult => {
+    disarmShutdown();
+    return {
+      contract: 1, ok: false, mode: "browser", landingUrl: null, capturedCookies: 0,
+      error: { code, message },
+    };
+  };
+
+  // Snapshot the cookie store BEFORE Chrome opens it: if this run ends with
+  // FEWER persistent Google cookies than it started with, the profile was
+  // damaged mid-run (killed/crashed window, torn SQLite WAL) or signed out -
+  // either way the user gets an exact diagnosis instead of "disappeared".
+  const cookiesBackup = backupCookies(browserDir);
 
   // Test/CI escape hatch: never open a browser.
   if (process.env.UNNES_NO_BROWSER) {
@@ -200,24 +547,23 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
   let ctx: unknown = null;
 
   const cleanup = async () => {
-    // Graceful close FIRST and let it finish: SIGKILLing Chrome drops the
-    // newest cookie writes (SQLite WAL not checkpointed), which are exactly
-    // the Google consent cookies set seconds before handoff. Kill is last
-    // resort only, so the planted Google session survives to disk.
+    // Graceful close FIRST and let it finish: killing Chrome mid-write can
+    // tear the cookie store (SQLite journal), which reads back as a
+    // "disappeared" Google session. Verified by experiment: CDP close() alone
+    // does NOT terminate an externally-spawned Chrome (still alive 30s+), so
+    // the wait-then-SIGTERM below is what actually reaps it - SIGTERM shuts
+    // Chrome down gracefully (exit code 0) with cookies intact. SIGKILL is
+    // the last resort only.
     try {
       if (browserToClose) await browserToClose.close().catch(() => {});
       else if (ctx) await (ctx as { close(): Promise<void> }).close().catch(() => {});
       const proc = cdpInstance?.proc;
-      if (proc) {
-        const exited = await new Promise<boolean>((resolve) => {
-          if (proc.exitCode !== null) return resolve(true);
-          const t = setTimeout(() => resolve(false), 5000);
-          proc.once("exit", () => { clearTimeout(t); resolve(true); });
-        });
-        if (!exited) proc.kill();
-      }
+      if (proc) await awaitChromeExit(proc);
     } catch { /* best effort */ }
   };
+  // From here on a browser may be alive: Ctrl+C / closed terminal / SIGTERM
+  // runs cleanup() first (flush profile) instead of nuking mid-write.
+  disarmShutdown = armShutdownGuard(cleanup);
 
   // 1. Try real Chrome via CDP first (Google does not block genuine Chrome binary)
   try {
@@ -237,7 +583,7 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
           .launchPersistentContext(browserDir, {
             headless: false,
             executablePath: chromeBin ?? undefined,
-            args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
+            args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy", ...MAIN_STORE_ARGS],
           });
         break;
       } catch (err) {
@@ -296,9 +642,14 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     // credential entry every time ("fresh spawning"). Open accounts.google.com
     // first so the user can plant a persistent session there - next logins
     // degrade to one click on the account chooser.
+    // The same read doubles as the pre-login persistence baseline: compared
+    // against the post-login state it proves whether THIS run damaged the
+    // profile (kill/crash/sign-out) or simply never planted anything.
+    let prePersist: GooglePersistence = { persistentAuth: [], sessionAuth: [], other: [] };
     try {
       const pre = await C.cookies().catch(() => [] as PlaywrightCookie[]);
-      const hasGoogle = (pre as PlaywrightCookie[]).some((c) => c.domain.includes("google"));
+      prePersist = googlePersistenceStatus(pre as PlaywrightCookie[]);
+      const hasGoogle = prePersist.persistentAuth.length + prePersist.sessionAuth.length + prePersist.other.length > 0;
       if (!hasGoogle) {
         const gpage = await C.newPage().catch(() => null);
         if (gpage && !(gpage as PageLike).isClosed()) {
@@ -369,7 +720,7 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
       const hasSession = (currentCookies as PlaywrightCookie[]).some(c => c.name === "identitas_sso");
       if (!hasSession) {
         await cleanup();
-        return fail("usage", "browser window was closed; login aborted, no session saved");
+        return fail("usage", "browser window was closed; login aborted, no portal session saved (anything already signed into Google in the profile tabs is kept on disk)");
       }
     }
 
@@ -399,7 +750,10 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     } catch { /* best effort */ }
 
     const all = await C.cookies();
-    const jar = CookieJar.empty();
+    // Overlay onto the EXISTING jar (never from empty): sibling-portal
+    // cookies the login window never visited (akademik/duanol sessions) stay
+    // valid server-side and must survive a hub-only re-login.
+    const jar = await CookieJar.load(jarPath);
     let captured = 0;
     const names = new Set<string>();
     for (const c of all as PlaywrightCookie[]) {
@@ -429,19 +783,51 @@ export async function browserLogin(jarPath: string, browserDir: string, hubUrl: 
     // only the Laravel session cookie (the hub disconnects Google itself via
     // auth2.disconnect(), which is why login always asks again).
     console.error("captured " + captured + " unnes.ac.id cookies: " + [...names].sort().join(", "));
-    const googleNames = [...new Set((all as PlaywrightCookie[]).filter((c) => c.domain.includes("google")).map((c) => c.name))];
-    if (googleNames.length > 0) {
-      console.error("Google session kept in profile (" + googleNames.length + " cookies: " + googleNames.sort().join(", ") + ") - next login is one click.");
+    const persist = googlePersistenceStatus(all as PlaywrightCookie[]);
+    const googlePersistent = persist.persistentAuth.length;
+    const change = persistenceChange(prePersist, persist);
+    if (change.kept) {
+      console.error("Google session kept in profile (" + persist.persistentAuth.join(", ") + ") - next login is one click.");
+    } else if (change.lost) {
+      // The profile ENTERED this run with a persistent session and leaves
+      // without one: killed/crashed window (torn cookie WAL) or an explicit
+      // Google sign-out mid-run. Say exactly that, plus the recovery.
+      console.error("!!! Google session LOST DURING this login: the profile had persistent auth");
+      console.error("!!! (" + prePersist.persistentAuth.join(", ") + ") when the window opened, now it has none.");
+      console.error("!!! Causes: the window/process was killed or crashed before Chrome flushed");
+      console.error("!!! cookies to disk (never Ctrl+C / close the terminal mid-login - let unnes");
+      console.error("!!! close the window itself), or you signed out of Google in one of the tabs.");
+      if (cookiesBackup) {
+        console.error("!!! A pre-login cookie backup exists at:");
+        console.error("!!!   " + cookiesBackup);
+        console.error("!!! With every browser closed you MAY restore it via:");
+        console.error("!!!   cp " + cookiesBackup + " " + join(browserDir, "Default", "Cookies"));
+        console.error("!!! then re-run unnes login fully. Skip the restore if you signed out on purpose.");
+      }
     } else {
-      console.error("WARNING: no Google cookies kept in this profile - next login will ask");
-      console.error("for full credentials again. Fix: sign into the accounts.google.com tab");
-      console.error("directly (stay signed in) before clicking Login dengan UNNES-ID.");
+      // Loud on purpose: with zero persistent auth cookies the account
+      // chooser is EMPTY on the next login ("accounts disappeared"), even
+      // though the portal session above is valid. Session-only auth cookies
+      // (expires -1) are dropped by Chrome on close - they never persist.
+      console.error("!!! Google sign-in will NOT persist - no persistent SID/SSID/HSID/SAPISID/APISID cookie in this profile.");
+      if (persist.sessionAuth.length > 0) {
+        console.error("!!! found session-only auth cookies (" + persist.sessionAuth.join(", ") + "): they die when the browser closes.");
+      } else if (persist.other.length > 0) {
+        console.error("!!! found only prefs/telemetry cookies (" + persist.other.join(", ") + "): those are not a sign-in.");
+      } else {
+        console.error("!!! found no Google cookies at all in this profile.");
+      }
+      console.error("!!! To fix: in the opened window, open the accounts.google.com tab FIRST,");
+      console.error("!!! sign in there and tick 'Stay signed in' (trust this device / 2FA),");
+      console.error("!!! THEN click 'Login dengan UNNES-ID' on the hub tab. Do not close the");
+      console.error("!!! window yourself - let unnes close it so cookies flush to disk.");
     }
     console.error("note: the hub severs its own Google grant after every handshake, so the");
     console.error("'Login dengan UNNES-ID' click stays - but with the session above it is");
     console.error("one click, no password retype. Session check any time: unnes status.");
     await cleanup();
-    return { contract: 1, ok: true, mode: "browser", landingUrl, capturedCookies: captured };
+    disarmShutdown();
+    return { contract: 1, ok: true, mode: "browser", landingUrl, capturedCookies: captured, googlePersistent };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await cleanup();
@@ -490,7 +876,12 @@ const LOGIN_MARKERS = /login dengan unnes-id|masukan email dan password|username
 const MOODLE_LOGIN_MARKERS = /you are not logged in|you must be logged in|log in\s*\|/i;
 
 async function launchContext(browserDir: string, headless = true): Promise<unknown> {
-  cleanStaleSingleton(browserDir);
+  // Render ops run on the SEPARATE headless profile (see renderDir): no
+  // background process may open the login profile headless (a headless
+  // visit burns the kept Google session server-side). All callers pass the
+  // main profile dir; the mapping happens here, in one place.
+  const dir = renderDir(browserDir);
+  cleanStaleSingleton(dir);
   const chromium = await import("playwright").then(
     (m) => (m as unknown as { chromium?: unknown; default?: { chromium?: unknown } }).chromium
       ?? (m as unknown as { default?: { chromium?: unknown } }).default?.chromium,
@@ -498,19 +889,20 @@ async function launchContext(browserDir: string, headless = true): Promise<unkno
   );
   if (!chromium) throw new Error("playwright is not installed; run: cd fetcher && npm ci && npx playwright install chromium");
   try {
-    mkdirSync(browserDir, { recursive: true });
-    chmodSync(browserDir, 0o700);
+    mkdirSync(dir, { recursive: true });
+    chmodSync(dir, 0o700);
   } catch { /* best effort */ }
   // FedCm disabled so gapi falls back to the popup flow (see above).
   // Headed is used by op=open so the user sees the real logged-in page in
   // the profile browser (the system default browser has no session).
   // Retry loop: another operation (submit, open) may hold the profile lock.
   // browserLogin has the same pattern for the same reason.
+  console.error("[browser] render context on profile " + dir + " via " + chromeLabel());
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
       const chromeBin = findChromeBinary();
       return await (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
-        .launchPersistentContext(browserDir, {
+        .launchPersistentContext(dir, {
           headless,
           executablePath: chromeBin ?? undefined,
           args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
@@ -553,7 +945,8 @@ async function loadJarIntoContext(jarPath: string, ctx: unknown): Promise<number
     // session often outlives the client-side timestamp (gateway sessions
     // slide). Inject expired-looking ones as session cookies instead —
     // after the op, syncJarFromContext re-captures fresh values + expiries.
-    if (c.expires && c.expires > Date.now()) ck.expires = c.expires / 1000;
+    // floored: fractional seconds can make addCookies reject valid cookies.
+    if (c.expires && c.expires > Date.now()) ck.expires = Math.floor(c.expires / 1000);
     try {
       await (ctx as { addCookies(cs: unknown[]): Promise<void> }).addCookies([ck]);
       n += 1;
@@ -584,6 +977,48 @@ async function syncJarFromContext(ctx: unknown, jar: CookieJar): Promise<number>
 
 
 /**
+ * Wait for a page state by SIGNAL instead of a fixed sleep: the watched
+ * response (armed before its trigger), then the selector that proves the
+ * follow-on render, both bounded by `timeoutMs`. Returns early the moment
+ * the state holds - the fixed 5-6s prime sleeps this replaces never could.
+ * Either signal alone suffices when only one is given; missing signals
+ * resolve `settled: false` instead of hanging. Exported for unit tests.
+ */
+export interface SettleOpts {
+  responseRe?: RegExp;
+  selector?: string;
+  timeoutMs?: number;
+}
+
+export async function settle(
+  page: {
+    waitForResponse(pred: (r: { url(): string }) => boolean, o?: unknown): Promise<unknown>;
+    waitForSelector(s: string, o?: unknown): Promise<unknown>;
+  },
+  opts: SettleOpts,
+): Promise<{ settled: boolean; elapsedMs: number }> {
+  const t0 = Date.now();
+  const cap = opts.timeoutMs ?? 8000;
+  if (!opts.responseRe && !opts.selector) return { settled: false, elapsedMs: 0 };
+  if (opts.responseRe) {
+    try {
+      await page.waitForResponse((r) => (opts.responseRe as RegExp).test(r.url()), { timeout: cap });
+    } catch {
+      /* fall through to the selector check */
+    }
+  }
+  if (opts.selector) {
+    const left = Math.max(1000, cap - (Date.now() - t0));
+    try {
+      await page.waitForSelector(opts.selector, { timeout: left });
+    } catch {
+      return { settled: false, elapsedMs: Date.now() - t0 };
+    }
+  }
+  return { settled: true, elapsedMs: Date.now() - t0 };
+}
+
+/**
  * Complete the Elena (app 30) session handshake inside the persistent
  * browser. The gateway iframe exchange alone only primes elena_gateway_session;
  * the final MoodleSession is established by:
@@ -597,19 +1032,57 @@ async function completeElenaSession(
   page: { url(): Promise<string>; frames(): { url(): Promise<string>; click(s: string, o?: unknown): Promise<void> }[]; click(s: string, o?: unknown): Promise<void> },
   semester: string,
 ): Promise<void> {
+  // Failures are logged (stderr is streamed for browser ops): a wrong
+  // semester or renamed button must not masquerade as a good prime.
+  const log = (m: string) => console.error("[elena-prime] " + m);
   try {
+    let foundSso = false;
     for (const f of page.frames()) {
       let u = "";
       try { u = await f.url(); } catch { continue; }
       if (u.includes("login_sso")) {
-        try { await f.click("#btnKlik_" + semester, { timeout: 5000 }); } catch { /* semester button missing */ }
+        foundSso = true;
+        try {
+          await f.click("#btnKlik_" + semester, { timeout: 5000 });
+        } catch {
+          log("semester button #btnKlik_" + semester + " missing (wrong semester? renamed?)");
+        }
         break;
       }
     }
-    await new Promise((r) => setTimeout(r, 5000));
-    try { await page.click("#btnTest", { timeout: 5000 }); } catch { /* continue button missing */ }
-    await new Promise((r) => setTimeout(r, 6000));
-  } catch { /* best effort: session may already be established */ }
+    if (!foundSso) log("no login_sso iframe found; handshake may already be done or the page changed");
+    // Was a fixed 5s sleep for the login_url page to load. Now: wait for
+    // its #btnTest continue button (bounded) - proceeds the moment it
+    // appears instead of always paying the full sleep.
+    const pg = page as unknown as {
+      waitForResponse(pred: (r: { url(): string }) => boolean, o?: unknown): Promise<unknown>;
+      waitForSelector(s: string, o?: unknown): Promise<unknown>;
+      waitForURL?(u: string | RegExp, o?: unknown): Promise<unknown>;
+    };
+    if (typeof pg.waitForResponse === "function" && typeof pg.waitForSelector === "function") {
+      await settle(pg, { selector: "#btnTest", timeoutMs: 8000 });
+    } else {
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    try {
+      await page.click("#btnTest", { timeout: 5000 });
+    } catch {
+      log("#btnTest continue button missing; handshake may already be done or the page changed");
+    }
+    // Was a fixed 6s sleep for the /my/ landing. Now: wait for the URL
+    // itself (bounded) - same ceiling class, usually instant.
+    if (typeof pg.waitForURL === "function") {
+      try {
+        await pg.waitForURL(/elena\.unnes\.ac\.id\/my/, { timeout: 8000 });
+      } catch {
+        /* fall through: session may already be established */
+      }
+    } else {
+      await new Promise((r) => setTimeout(r, 6000));
+    }
+  } catch (e) {
+    log("handshake error (best effort, session may already be established): " + (e instanceof Error ? e.message : String(e)).slice(0, 160));
+  }
 }
 
 export async function renderPage(jarPath: string, browserDir: string, opts: RenderPageOpts): Promise<RenderPageResult> {
@@ -628,8 +1101,16 @@ export async function renderPage(jarPath: string, browserDir: string, opts: Rend
     const message = err instanceof Error ? err.message : String(err);
     return { ...base, error: { code: "usage", message: message } };
   }
-  const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
+  // Ctrl+C / closed terminal mid-render must flush, not tear, the profile.
+  const disarmShutdown = armShutdownGuard(async () => {
+    try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
+  });
+  let page: unknown;
   try {
+    // Inside the guarded try: a newPage() throw now funnels through the
+    // normal error path (and the guarded close) instead of leaking the
+    // browser with no cleanup.
+    page = await (ctx as { newPage(): Promise<unknown> }).newPage();
     const hub = opts.hubUrl ?? "https://apps.unnes.ac.id";
     if (opts.ssoApp) {
       await (page as { goto(u: string, o?: unknown): Promise<unknown> }).goto(hub + "/" + opts.ssoApp, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -663,18 +1144,19 @@ export async function renderPage(jarPath: string, browserDir: string, opts: Rend
     let finalUrl = "";
     try { finalUrl = await (page as { url(): Promise<string> }).url(); } catch { /* closed */ }
 
-    const jar = await CookieJar.load(jarPath);
-    const captured = await syncJarFromContext(ctx, jar);
-    await jar.save(jarPath);
-
-    // Session health: target redirected back to the gateway login, or the
-    // gateway's login page (has the UNNES-ID button) is showing.
+    // Session health FIRST: an expired render must never persist the
+    // guest/anonymous cookies the login page issued (that would clobber the
+    // good jar and fail the next op too - same guard as the http.ts rollback).
     const body = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
     const landedOnGateway = finalUrl.startsWith("https://apps.unnes.ac.id");
     const sessionExpired = (landedOnGateway && LOGIN_MARKERS.test(body)) || /\/auth\/login/i.test(finalUrl) || MOODLE_LOGIN_MARKERS.test(body);
     if (sessionExpired) {
-      return { ...base, finalUrl, sessionExpired: true, capturedCookies: captured, error: { code: "session", message: "session expired; run: unnes login" } };
+      return { ...base, finalUrl, sessionExpired: true, capturedCookies: 0, error: { code: "session", message: "session expired; run: unnes login" } };
     }
+
+    const jar = await CookieJar.load(jarPath);
+    const captured = await syncJarFromContext(ctx, jar);
+    await jar.save(jarPath);
 
     let records: Record<string, string>[] = [];
     if (opts.extract) {
@@ -686,6 +1168,7 @@ export async function renderPage(jarPath: string, browserDir: string, opts: Rend
     const message = err instanceof Error ? err.message : String(err);
     return { ...base, error: { code: "network", message: "page render failed: " + message } };
   } finally {
+    disarmShutdown();
     try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
   }
 }
@@ -722,6 +1205,9 @@ export interface CrawlResult {
   finalUrl: string | null;
   sessionExpired: boolean;
   followed: number;
+  /** links skipped (goto/selector failure) - records are a silent subset
+   * without this count, so it is reported, not hidden. */
+  skipped: number;
   records: Record<string, string>[];
   error?: { code: string; message: string };
   [k: string]: unknown;
@@ -730,7 +1216,7 @@ export interface CrawlResult {
 export async function crawlPage(jarPath: string, browserDir: string, opts: CrawlOpts): Promise<CrawlResult> {
   const base = {
     contract: 1, ok: false as boolean, op: "crawl" as const,
-    finalUrl: null as string | null, sessionExpired: false, followed: 0, records: [] as Record<string, string>[],
+    finalUrl: null as string | null, sessionExpired: false, followed: 0, skipped: 0, records: [] as Record<string, string>[],
   };
   if (process.env.UNNES_NO_BROWSER) {
     return { ...base, error: { code: "usage", message: "crawl disabled via UNNES_NO_BROWSER" } };
@@ -743,16 +1229,21 @@ export async function crawlPage(jarPath: string, browserDir: string, opts: Crawl
     const message = err instanceof Error ? err.message : String(err);
     return { ...base, error: { code: "usage", message } };
   }
-  const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
-  const P = page as {
-    goto(u: string, o?: unknown): Promise<unknown>;
-    url(): Promise<string>;
-    content(): Promise<string>;
-    waitForSelector(s: string, o?: unknown): Promise<unknown>;
-    evaluate(fn: string): Promise<unknown>;
-  };
+  // Ctrl+C / closed terminal mid-render must flush, not tear, the profile.
+  const disarmShutdown = armShutdownGuard(async () => {
+    try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
+  });
+  let page: unknown;
   const maxLinks = opts.maxLinks ?? 50;
   try {
+    page = await (ctx as { newPage(): Promise<unknown> }).newPage();
+    const P = page as {
+      goto(u: string, o?: unknown): Promise<unknown>;
+      url(): Promise<string>;
+      content(): Promise<string>;
+      waitForSelector(s: string, o?: unknown): Promise<unknown>;
+      evaluate(fn: string): Promise<unknown>;
+    };
     const hub = opts.hubUrl ?? "https://apps.unnes.ac.id";
     if (opts.ssoApp) {
       await P.goto(hub + "/" + opts.ssoApp, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -789,20 +1280,21 @@ export async function crawlPage(jarPath: string, browserDir: string, opts: Crawl
     }
     // Collect absolute same-origin links.
     const links = (await P.evaluate(
-      "(function(){var out=[];var seen={};document.querySelectorAll(SEL).forEach(function(a){var h=a.href||a.getAttribute('href');if(!h)return;var u=new URL(h,location.href);if(!/unnes\\.ac\\.id$/.test(u.hostname)&&u.hostname!=='elena.unnes.ac.id'&&u.hostname!=='akademik.unnes.ac.id'&&u.hostname!=='student.unnes.ac.id')return;if(seen[u.href])return;seen[u.href]=1;out.push({href:u.href,text:(a.innerText||a.textContent||'').replace(/\\s+/g,' ').trim().slice(0,120)});});return out;})()"
-        .replace("SEL", JSON.stringify(opts.linkSelector)),
+      "(function(){var out=[];var seen={};document.querySelectorAll(__UNNES_SEL__).forEach(function(a){var h=a.href||a.getAttribute('href');if(!h)return;var u=new URL(h,location.href);if(!/(^|\\.)unnes\\.ac\\.id$/.test(u.hostname))return;if(seen[u.href])return;seen[u.href]=1;out.push({href:u.href,text:(a.innerText||a.textContent||'').replace(/\\s+/g,' ').trim().slice(0,120)});});return out;})()"
+        .split("__UNNES_SEL__").join(JSON.stringify(opts.linkSelector)),
     )) as { href: string; text: string }[];
 
     const { extractRecords } = await import("./extract.js");
     const records: Record<string, string>[] = [];
     const waitMs = opts.waitMs ?? 15000;
+    let skipped = 0;
     for (const link of links.slice(0, maxLinks)) {
       try {
         await P.goto(link.href, { waitUntil: "domcontentloaded", timeout: 60000 });
-      } catch { continue; }
+      } catch { skipped += 1; continue; }
       try {
         await P.waitForSelector(opts.pageExtract.selector, { timeout: waitMs });
-      } catch { continue; } // page without matches: skip
+      } catch { skipped += 1; continue; } // page without matches: counted, not hidden
       const html = await P.content();
       const recs = extractRecords(html, opts.pageExtract);
       for (const r of recs) {
@@ -812,11 +1304,13 @@ export async function crawlPage(jarPath: string, browserDir: string, opts: Crawl
     const jar = await CookieJar.load(jarPath);
     await syncJarFromContext(ctx, jar);
     await jar.save(jarPath);
-    return { ...base, ok: true, finalUrl: await safeUrl(P), followed: Math.min(links.length, maxLinks), records };
+    if (skipped > 0) console.error(`[crawl] ${skipped}/${Math.min(links.length, maxLinks)} links skipped (goto/selector failures)`);
+    return { ...base, ok: true, finalUrl: await safeUrl(P), followed: Math.min(links.length, maxLinks), skipped, records };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ...base, error: { code: "network", message: "crawl failed: " + message } };
   } finally {
+    disarmShutdown();
     try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
   }
 }
@@ -850,6 +1344,8 @@ export interface BatchPageResult {
   finalUrl: string | null;
   sessionExpired: boolean;
   records: Record<string, string>[];
+  /** crawl-mode links skipped (goto/selector failure) */
+  skipped?: number;
   error?: { code: string; message: string };
 }
 
@@ -879,17 +1375,18 @@ async function batchCrawlLinks(
     return;
   }
   const links = (await P.evaluate(
-    "(function(){var out=[];var seen={};document.querySelectorAll(SEL).forEach(function(a){var h=a.href||a.getAttribute('href');if(!h)return;var u=new URL(h,location.href);if(!/unnes\.ac\.id$/.test(u.hostname))return;if(seen[u.href])return;seen[u.href]=1;out.push({href:u.href,text:(a.innerText||a.textContent||'').replace(/\s+/g,' ').trim().slice(0,120)});});return out;})()"
-      .replace("SEL", JSON.stringify(entry.linkSelector)),
+    "(function(){var out=[];var seen={};document.querySelectorAll(__UNNES_SEL__).forEach(function(a){var h=a.href||a.getAttribute('href');if(!h)return;var u=new URL(h,location.href);if(!/(^|\\.)unnes\\.ac\\.id$/.test(u.hostname))return;if(seen[u.href])return;seen[u.href]=1;out.push({href:u.href,text:(a.innerText||a.textContent||'').replace(/\\s+/g,' ').trim().slice(0,120)});});return out;})()"
+      .split("__UNNES_SEL__").join(JSON.stringify(entry.linkSelector)),
   )) as { href: string; text: string }[];
   const maxLinks = entry.maxLinks ?? 50;
   const records: Record<string, string>[] = [];
+  let skipped = 0;
   for (const link of links.slice(0, maxLinks)) {
     try {
       await P.goto(link.href, { waitUntil: "domcontentloaded", timeout: 60000 });
-    } catch { continue; }
+    } catch { skipped += 1; continue; }
     if (entry.extract?.selector) {
-      try { await P.waitForSelector(entry.extract.selector, { timeout: entry.waitMs ?? 15000 }); } catch { continue; }
+      try { await P.waitForSelector(entry.extract.selector, { timeout: entry.waitMs ?? 15000 }); } catch { skipped += 1; continue; }
     }
     const html = await P.content();
     const recs = extractRecords(html, entry.extract ?? { selector: "body" });
@@ -899,6 +1396,7 @@ async function batchCrawlLinks(
   }
   r.finalUrl = await P.url();
   r.records = records;
+  r.skipped = skipped;
 }
 export async function batchPages(
   jarPath: string,
@@ -920,17 +1418,22 @@ export async function batchPages(
     const message = err instanceof Error ? err.message : String(err);
     return fail("usage", message);
   }
-  const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
-  const P = page as {
-    goto(u: string, o?: unknown): Promise<unknown>;
-    url(): Promise<string>;
-    content(): Promise<string>;
-    waitForSelector(s: string, o?: unknown): Promise<unknown>;
-    evaluate(fn: string): Promise<unknown>;
-  };
+  // Ctrl+C / closed terminal mid-render must flush, not tear, the profile.
+  const disarmShutdown = armShutdownGuard(async () => {
+    try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
+  });
+  let page: unknown;
   const primed = new Set<string>();
   const results: BatchPageResult[] = [];
   try {
+    page = await (ctx as { newPage(): Promise<unknown> }).newPage();
+    const P = page as {
+      goto(u: string, o?: unknown): Promise<unknown>;
+      url(): Promise<string>;
+      content(): Promise<string>;
+      waitForSelector(s: string, o?: unknown): Promise<unknown>;
+      evaluate(fn: string): Promise<unknown>;
+    };
     for (const entry of entries) {
       const r: BatchPageResult = { url: entry.url, ok: false, finalUrl: null, sessionExpired: false, records: [] };
       try {
@@ -973,6 +1476,9 @@ export async function batchPages(
           const landedOnGateway = (r.finalUrl ?? "").startsWith("https://apps.unnes.ac.id");
           r.sessionExpired = (landedOnGateway && LOGIN_MARKERS.test(body)) || /\/auth\/login/i.test(r.finalUrl ?? "") || MOODLE_LOGIN_MARKERS.test(body);
           if (r.sessionExpired) {
+            // Honest error (not "unknown batch error"): the Rust side keys
+            // its exit-4 session handling off this message.
+            r.error = { code: "session", message: "session expired; run: unnes login" };
             results.push(r);
             continue;
           }
@@ -989,26 +1495,41 @@ export async function batchPages(
       results.push(r);
     }
     const jar = await CookieJar.load(jarPath);
-    const captured = await syncJarFromContext(ctx, jar);
-    await jar.save(jarPath);
+    // Quarantine: one expired entry means the context holds guest cookies -
+    // persisting them would clobber the good jar (see renderPage verdict).
+    const anyExpired = results.some((r) => r.sessionExpired);
+    let captured = 0;
+    if (!anyExpired) {
+      captured = await syncJarFromContext(ctx, jar);
+      await jar.save(jarPath);
+    }
     return { contract: 1, ok: true, op: "batch", results, capturedCookies: captured };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return fail("internal", "batch render failed: " + message);
   } finally {
+    disarmShutdown();
     try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
   }
 }
 
 
 // ---------------------------------------------------------------------------
-// op: login mode=auto - scripted HEADLESS re-login.
-// The persistent profile remembers the Google account; when the gateway
-// session lapses we can usually re-establish it without user interaction:
-// click the UNNES-ID button, then click through the Google consent/account
-// screens if they appear (remembered account, "Allow"/"Continue"). If Google
-// demands anything else (password, 2FA, CAPTCHA) we fail with
-// needsInteraction and the caller falls back to the headed browser login.
+// op: login mode=auto - scripted re-login without surprise windows.
+//
+// Single-writer rule for the MAIN profile: only headed, user-supervised
+// flows open it. A headless open burns the planted Google session
+// server-side (Google serves a blank identifier instead of the chooser
+// afterwards), which is why re-logins used to demand a full password every
+// time. So there is deliberately NO headless browser attempt here:
+//   - non-interactive callers (status/TUI/watch) get needsInteraction when
+//     the gateway lapses and the user does one headed chooser click;
+//   - interactive callers go straight to the headed scripted click-through
+//     (chooser/consent) and then the manual browser login.
+// Plain-HTTP SSO refresh (op=sso) still heals app sessions without any
+// browser. If Google demands anything beyond a click (password, 2FA,
+// CAPTCHA) we fail with needsInteraction and the caller falls back to the
+// headed browser login.
 // ---------------------------------------------------------------------------
 
 export async function autoLogin(
@@ -1023,7 +1544,9 @@ export async function autoLogin(
     return fail("usage", "auto login disabled via UNNES_NO_BROWSER");
   }
 
-  // 1. Headless scripted attempt: zero windows when Google cooperates.
+  // 1. Headless scripted attempt: disabled by design (single-writer rule -
+  // scriptedOAuth returns null immediately for headless). Zero windows AND
+  // zero profile touches when non-interactive; the kept session survives.
   {
     const res = await scriptedOAuth(jarPath, browserDir, true);
     if (res) return res;
@@ -1059,6 +1582,20 @@ export async function autoLogin(
 // Returns a BrowserLoginResult when done, or null to try the next mode.
 // ---------------------------------------------------------------------------
 async function scriptedOAuth(jarPath: string, browserDir: string, headless: boolean): Promise<BrowserLoginResult | null> {
+  // MAIN-profile single-writer rule: a HEADLESS open of the login profile
+  // burns the planted Google session (observed: 40+ cookies wiped and the
+  // popup served a blank identifier instead of the chooser right after a
+  // headless visit; every status/TUI/watch auto attempt re-burned it, so the
+  // next `unnes login` always asked for a full password again). The old
+  // in-flow burn guard ran AFTER the damaging launch + hub navigation, which
+  // is too late. So headless scripted never launches at all: return null and
+  // let the caller escalate to headed (one chooser click on the kept
+  // session) or report needsInteraction. Only headed, user-supervised flows
+  // may open MAIN.
+  if (headless) {
+    console.error("[auto-login] headless scripted disabled on the login profile (would burn the kept Google session); escalating");
+    return null;
+  }
   cleanStaleSingleton(browserDir);
   let cdpInstance: CDPChromeInstance | null = null;
   let ctx: unknown = null;
@@ -1080,7 +1617,10 @@ async function scriptedOAuth(jarPath: string, browserDir: string, headless: bool
       const mod = (await import("playwright")) as unknown as { chromium?: unknown; default?: { chromium?: unknown } };
       chromium = mod.chromium ?? mod.default?.chromium ?? null;
     } catch { /* below */ }
-    if (!chromium) return null;
+    if (!chromium) {
+      console.error("[auto-login] playwright unavailable, trying next mode");
+      return null;
+    }
 
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
@@ -1089,17 +1629,23 @@ async function scriptedOAuth(jarPath: string, browserDir: string, headless: bool
           .launchPersistentContext(browserDir, {
             headless,
             executablePath: chromeBin ?? undefined,
-            args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
+            args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy", ...MAIN_STORE_ARGS],
           });
         break;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        if (!/user data directory is already in use|profile in use|singleton|process singleton/i.test(message)) return null;
+        if (!/user data directory is already in use|profile in use|singleton|process singleton/i.test(message)) {
+          console.error("[auto-login] launch failed, trying next mode: " + message.slice(0, 160));
+          return null;
+        }
         await new Promise((r) => setTimeout(r, 12000));
       }
     }
   }
-  if (!ctx) return null;
+  if (!ctx) {
+    console.error("[auto-login] could not launch browser (profile locked?), trying next mode");
+    return null;
+  }
   const C = ctx as {
     pages(): unknown[];
     close(): Promise<void>;
@@ -1111,16 +1657,29 @@ async function scriptedOAuth(jarPath: string, browserDir: string, headless: bool
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     }).catch(() => {});
   } catch { /* best effort */ }
-  const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
-  const P = page as {
-    goto(u: string, o?: unknown): Promise<unknown>;
-    url(): Promise<string>;
-    content(): Promise<string>;
-    evaluate(fn: string | ((...a: any[]) => unknown), arg?: unknown): Promise<unknown>;
-    waitForTimeout(ms: number): Promise<void>;
-    click(s: string, o?: unknown): Promise<void>;
-  };
+  // Ctrl+C / closed terminal mid-render must flush, not tear, the profile.
+  // The closer also reaps the CDP process: close() alone never terminates an
+  // externally-spawned Chrome (verified: still alive 30s+), which would leak
+  // an orphan holding the profile lock.
+  const disarmShutdown = armShutdownGuard(async () => {
+    try {
+      if (browserToClose) await browserToClose.close().catch(() => {});
+      else await C.close().catch(() => {});
+    } catch { /* already closed */ }
+    const proc = cdpInstance?.proc;
+    if (proc) await awaitChromeExit(proc);
+  });
+  let page: unknown;
   try {
+    page = await (ctx as { newPage(): Promise<unknown> }).newPage();
+    const P = page as {
+      goto(u: string, o?: unknown): Promise<unknown>;
+      url(): Promise<string>;
+      content(): Promise<string>;
+      evaluate(fn: string | ((...a: any[]) => unknown), arg?: unknown): Promise<unknown>;
+      waitForTimeout(ms: number): Promise<void>;
+      click(s: string, o?: unknown): Promise<void>;
+    };
     await P.goto("https://apps.unnes.ac.id/", { waitUntil: "domcontentloaded", timeout: 60000 });
     await P.waitForTimeout(4000);
     const state0 = (await P.evaluate(() => ({
@@ -1144,7 +1703,10 @@ async function scriptedOAuth(jarPath: string, browserDir: string, headless: bool
       const pre = await (C as unknown as { cookies(): Promise<PlaywrightCookie[]> }).cookies().catch(() => [] as PlaywrightCookie[]);
       const hasGoogleSession = (pre as PlaywrightCookie[]).some((c) =>
         c.domain.includes("google") && /^(SID|SSID|HSID|SAPISID|APISID)$/.test(c.name));
-      if (hasGoogleSession && headless) return null;
+      if (hasGoogleSession && headless) {
+        console.error("[auto-login] live Google session + headless: escalating to headed (never summon the popup headless)");
+        return null;
+      }
     } catch { /* best effort: proceed without the guard */ }
 
     // Channel A: postmessage listener + remember the gapi instance
@@ -1163,6 +1725,7 @@ async function scriptedOAuth(jarPath: string, browserDir: string, headless: bool
     try {
       await P.click("#btn-google", { timeout: 8000 });
     } catch {
+      console.error("[auto-login] no #btn-google on the hub page (layout changed?), trying next mode");
       return null;
     }
 
@@ -1198,27 +1761,28 @@ async function scriptedOAuth(jarPath: string, browserDir: string, headless: bool
         } catch { /* popup closed */ }
       }
     }
-    if (!token) return null;
+    if (!token) {
+      console.error("[auto-login] no id_token after 75s (popup blocked? consent denied? chooser layout changed?), trying next mode");
+      return null;
+    }
 
     // POST the id_token to the hub and verify the session really works.
     const verified = await completeHubLogin(P, C, jarPath, token);
+    if (!verified) console.error("[auto-login] hub POST/verify failed, trying next mode");
     return verified;
-  } catch {
+  } catch (err) {
+    console.error("[auto-login] scripted attempt failed, trying next mode: " + (err instanceof Error ? err.message : String(err)).slice(0, 160));
     return null;
   } finally {
+    disarmShutdown();
     try {
       if (browserToClose) await browserToClose.close().catch(() => {});
       else await C.close().catch(() => {});
-      // Same WAL reasoning as browserLogin cleanup: let Chrome flush to disk,
-      // SIGKILL only if it refuses to exit (killing loses the newest cookies).
+      // Same flush-first reasoning as browserLogin cleanup (see
+      // awaitChromeExit): close() alone never terminates an
+      // externally-spawned Chrome, so verify + SIGTERM + SIGKILL.
       const proc = cdpInstance?.proc;
-      if (proc && proc.exitCode === null) {
-        const exited = await new Promise<boolean>((resolve) => {
-          const t = setTimeout(() => resolve(false), 5000);
-          proc.once("exit", () => { clearTimeout(t); resolve(true); });
-        });
-        if (!exited) proc.kill();
-      }
+      if (proc) await awaitChromeExit(proc);
     } catch { /* already closed */ }
   }
 }
@@ -1232,14 +1796,21 @@ async function completeHubLogin(
   idToken: string,
 ): Promise<BrowserLoginResult | null> {
   try {
-    let email = "vascoyudha1@students.unnes.ac.id";
+    // The hub POST needs the token owner's email: decode it from the JWT.
+    // There is deliberately NO personal fallback - posting someone else's
+    // address with your token misattributes the login server-side.
+    let email = "";
     try {
       const parts = idToken.split(".");
       if (parts.length >= 2) {
         const payload = JSON.parse(Buffer.from(parts[1], "base64").toString("utf8"));
-        if (payload.email) email = payload.email;
+        if (typeof payload.email === "string") email = payload.email;
       }
-    } catch { /* fallback to default */ }
+    } catch { /* below */ }
+    if (!email) {
+      console.error("[login] cannot decode email from id_token; aborting hub POST (re-run login)");
+      return null;
+    }
     const postRaw = String(await P.evaluate(async (a: { csrf: string; email: string; idToken: string }) => {
       const csrfEl = document.querySelector('meta[name="csrf-token"]') as HTMLMetaElement | null;
       const csrf = (csrfEl || { content: "" }).content || "";
@@ -1315,40 +1886,73 @@ export interface SubmitResult {
   finalUrl: string | null;
   sessionExpired: boolean;
   message: string;
+  /** verification flags read from the real page state (ok:true but all false
+   * means the upload could not be confirmed - the CLI warns instead of
+   * claiming success) */
+  submitted: boolean;
+  draft: boolean;
+  hasFile: boolean;
   error?: { code: string; message: string };
   [k: string]: unknown;
+}
+
+export interface SubmitFinalState {
+  submitted: boolean;
+  draft: boolean;
+  status: string;
+  hasFile: boolean;
+  url: string;
+}
+
+/** Human message for the verified end state. Exported for unit tests. */
+export function describeSubmitState(s: SubmitFinalState): string {
+  if (s.submitted) return "submitted for grading: " + s.status;
+  if (s.draft || s.hasFile) return "file uploaded and saved as draft";
+  return "upload finished but no submission state could be verified on the page"
+    + " - open the assignment URL to confirm (it may still need a manual Save/Submit click,"
+    + " or the cmid may point at a page without a submission form)";
 }
 
 export async function submitAssignment(jarPath: string, browserDir: string, opts: SubmitOpts): Promise<SubmitResult> {
   const base = {
     contract: 1, ok: false as boolean, op: "submit" as const,
-    finalUrl: null as string | null, sessionExpired: false, message: ""
+    finalUrl: null as string | null, sessionExpired: false, message: "",
+    submitted: false, draft: false, hasFile: false,
   };
   const log = (m: string) => console.error("[submit] " + m);
   if (process.env.UNNES_NO_BROWSER) {
-    return { ...base, error: { code: "usage", message: "submit disabled via UNNES_NO_BROWSER" } };
+    return { ...base, error: { code: "usage", message: "submit disabled via UNNES_NO_BROWSER (unset it to submit)" } };
   }
+  // Stage tag: the outer catch reports WHERE it broke, so the CLI can tell
+  // the user the cause instead of a bare "submit failed".
+  let stage = "launch";
   let ctx: unknown;
   try {
     ctx = await launchContext(browserDir);
     await loadJarIntoContext(jarPath, ctx);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return { ...base, error: { code: "usage", message } };
+    return { ...base, error: { code: "usage", message: "submit failed at stage 'launch': " + message } };
   }
-  const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
-  const P = page as {
-    goto(u: string, o?: unknown): Promise<unknown>;
-    url(): Promise<string>;
-    content(): Promise<string>;
-    click(s: string, o?: unknown): Promise<void>;
-    waitForSelector(s: string, o?: unknown): Promise<unknown>;
-    setInputFiles(s: string, f: string, o?: unknown): Promise<void>;
-    evaluate(fn: string | ((...a: any[]) => unknown), arg?: unknown): Promise<unknown>;
-    waitForTimeout(ms: number): Promise<void>;
-  };
+  // Ctrl+C / closed terminal mid-render must flush, not tear, the profile.
+  const disarmShutdown = armShutdownGuard(async () => {
+    try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
+  });
+  let page: unknown;
   try {
+    page = await (ctx as { newPage(): Promise<unknown> }).newPage();
+    const P = page as {
+      goto(u: string, o?: unknown): Promise<unknown>;
+      url(): Promise<string>;
+      content(): Promise<string>;
+      click(s: string, o?: unknown): Promise<void>;
+      waitForSelector(s: string, o?: unknown): Promise<unknown>;
+      setInputFiles(s: string, f: string, o?: unknown): Promise<void>;
+      evaluate(fn: string | ((...a: any[]) => unknown), arg?: unknown): Promise<unknown>;
+      waitForTimeout(ms: number): Promise<void>;
+    };
     // 1. prime the gateway app session (same as renderPage/crawl)
+    stage = "prime";
     const hub = opts.hubUrl ?? "https://apps.unnes.ac.id";
     if (opts.ssoApp) {
       await P.goto(hub + "/" + opts.ssoApp, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -1356,7 +1960,7 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
       let u = "";
       try { u = await P.url(); } catch { /* closed */ }
       if (/\/(auth\/)?login/i.test(u)) {
-        return { ...base, sessionExpired: true, error: { code: "session", message: "gateway session expired; run: unnes login" } };
+        return { ...base, sessionExpired: true, error: { code: "session", message: "gateway session expired at stage 'prime'; run: unnes login" } };
       }
     }
     if (opts.ssoApp === "30") {
@@ -1364,6 +1968,7 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
     }
 
     // 2. open the assignment page
+    stage = "open";
     await P.goto(opts.url, { waitUntil: "domcontentloaded", timeout: 60000 });
     await P.waitForTimeout(3000);
     const finalUrl = await P.url();
@@ -1374,7 +1979,7 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
     const body0 = html0.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 400);
     const landedOnGateway = finalUrl.startsWith("https://apps.unnes.ac.id");
     if ((landedOnGateway && LOGIN_MARKERS.test(body0)) || /\/auth\/login/i.test(finalUrl) || MOODLE_LOGIN_MARKERS.test(body0)) {
-      return { ...base, sessionExpired: true, finalUrl, error: { code: "session", message: "session expired; run: unnes login" } };
+      return { ...base, sessionExpired: true, finalUrl, error: { code: "session", message: "session expired at stage 'open' (assignment page shows a login screen); run: unnes login" } };
     }
 
     // 4. already-submitted guard: never touch a finalized submission
@@ -1387,7 +1992,7 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
     if (state1.alreadySubmitted) {
       const msg = "tugas sudah dikumpulkan (file sudah ada di server - buka dengan Enter untuk melihat)";
       log(msg);
-      return { ...base, ok: true, finalUrl, message: msg };
+      return { ...base, ok: true, finalUrl, message: msg, submitted: true, hasFile: true };
     }
 
     // 5. open the submission form: click "Add submission" (a submit button
@@ -1445,10 +2050,14 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
       } catch { /* selector not present */ }
     }
     if (!uploaded) {
-      const msg = "could not attach the file to any file input; run with UNNES_VERBOSE=1 for the DOM state";
+      const msg = "could not attach the file at stage 'attach': the assignment page shows no file input."
+        + " Likely causes: the submission is already finalized, it is past due (form closed),"
+        + " the cmid points at a non-assignment page, or the form needs its 'Add submission'"
+        + " button clicked first. Open " + opts.url + " in a browser to check.";
       log(msg);
       return { ...base, finalUrl, error: { code: "usage", message: msg } };
     }
+    stage = "finalize";
     await P.waitForTimeout(2000);
 
     // 8. confirm the file is staged, then save/submit
@@ -1512,19 +2121,20 @@ export async function submitAssignment(jarPath: string, browserDir: string, opts
       await P.waitForTimeout(1000);
     }
     log("final state: " + JSON.stringify(finalState));
-    const message = finalState.submitted
-      ? "submitted for grading: " + finalState.status
-      : (finalState.draft || finalState.hasFile)
-        ? "file uploaded and saved as draft"
-        : "file attached to the draft area; no submission status change detected";
+    stage = "verify";
+    const message = describeSubmitState(finalState);
     const jar = await CookieJar.load(jarPath);
     const captured = await syncJarFromContext(ctx, jar);
     await jar.save(jarPath);
-    return { ...base, ok: true, finalUrl: await P.url(), message, capturedCookies: captured };
+    return {
+      ...base, ok: true, finalUrl: await P.url(), message, capturedCookies: captured,
+      submitted: finalState.submitted, draft: finalState.draft, hasFile: finalState.hasFile,
+    };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return { ...base, error: { code: "internal", message: "submit failed: " + message } };
+    return { ...base, error: { code: "internal", message: "submit failed at stage '" + stage + "': " + message } };
   } finally {
+    disarmShutdown();
     try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
   }
 }
@@ -1574,17 +2184,22 @@ export async function openInProfileBrowser(jarPath: string, browserDir: string, 
     const message = err instanceof Error ? err.message : String(err);
     return { ...base, error: { code: "usage", message } };
   }
-  const page = await (ctx as { newPage(): Promise<unknown> }).newPage();
-  const P = page as {
-    goto(u: string, o?: unknown): Promise<unknown>;
-    url(): Promise<string>;
-    waitForTimeout(ms: number): Promise<void>;
-    isClosed(): boolean;
-  };
+  // Ctrl+C / closed terminal mid-render must flush, not tear, the profile.
+  const disarmShutdown = armShutdownGuard(async () => {
+    try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
+  });
+  let page: unknown;
   // 5 minutes default: short enough that other profile operations (submit,
   // page render) don't starve waiting for the lock, long enough to read a page.
   const deadline = Date.now() + (opts.maxMs ?? 5 * 60 * 1000);
   try {
+    page = await (ctx as { newPage(): Promise<unknown> }).newPage();
+    const P = page as {
+      goto(u: string, o?: unknown): Promise<unknown>;
+      url(): Promise<string>;
+      waitForTimeout(ms: number): Promise<void>;
+      isClosed(): boolean;
+    };
     const hub = opts.hubUrl ?? "https://apps.unnes.ac.id";
     if (opts.ssoApp) {
       await P.goto(hub + "/" + opts.ssoApp, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -1617,6 +2232,7 @@ export async function openInProfileBrowser(jarPath: string, browserDir: string, 
     const message = err instanceof Error ? err.message : String(err);
     return { ...base, error: { code: "internal", message: "open failed: " + message } };
   } finally {
+    disarmShutdown();
     try { await (ctx as { close(): Promise<void> }).close(); } catch { /* already closed */ }
   }
 }

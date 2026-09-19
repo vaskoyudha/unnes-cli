@@ -99,6 +99,15 @@ function startServer() {
       res.end("<html><body>version one</body></html>");
       return;
     }
+    if (url.pathname === "/settle-page") {
+      // signal-wait fixture: #r appears only after the /marker XHR lands
+      res.end(`<html><body><div id="r" style="display:none">x</div><script>fetch("/marker").then(() => { document.getElementById("r").style.display = "block"; });</script></body></html>`);
+      return;
+    }
+    if (url.pathname === "/marker") {
+      res.end("ok");
+      return;
+    }
     if (url.pathname === "/slow") {
       // concurrency probe: holds the socket, tracks server-side peak
       const ms = Math.min(Number(url.searchParams.get("n") ?? "150") || 150, 2000);
@@ -762,4 +771,33 @@ test("batchget concurrency fans out within the cap", async (t) => {
     assert.ok(slowStats().peak >= 2, "no parallelism observed");
     assert.ok(dt < 800, "6x150ms took " + dt + "ms, still serial?");
   });
+});
+
+test("settle returns on response+selector without the full timeout", async (t) => {
+  const { server, base } = await startServer();
+  t.after(() => new Promise((res) => server.close(res)));
+  const mod = await import("playwright").catch(() => null);
+  const chromium = mod?.chromium ?? mod?.default?.chromium ?? null;
+  if (!chromium) { t.skip("no playwright"); return; }
+  const { settle } = await import("../dist/browser.js");
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+  } catch (e) {
+    t.skip("cannot launch chromium: " + String(e).slice(0, 100));
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    // arm before navigation so the marker response is observed, not missed
+    const pending = settle(page, { responseRe: /\/marker/, selector: "#r:visible", timeoutMs: 5000 });
+    await page.goto(base + "/settle-page");
+    const r = await pending;
+    assert.equal(r.settled, true);
+    assert.ok(r.elapsedMs < 2500, "took " + r.elapsedMs + "ms");
+    const s2 = await settle(page, { responseRe: /\/never-there/, selector: "#missing:visible", timeoutMs: 800 });
+    assert.equal(s2.settled, false);
+  } finally {
+    await browser.close().catch(() => {});
+  }
 });
