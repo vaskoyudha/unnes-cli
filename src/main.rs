@@ -14,6 +14,7 @@ mod diff;
 mod fetcher;
 mod jadwal;
 mod kurikulum;
+mod materi;
 mod output;
 mod paths;
 mod peserta;
@@ -81,6 +82,8 @@ enum Cmd {
     Jadwal,
     /// Tugas: Elena assignments/quizzes with deadlines and submission status
     Tugas(TugasArgs),
+    /// Materi: Elena course materials (files/resources) - list and download
+    Materi(MateriArgs),
     /// TUI: interactive dashboard (ratatui)
     Tui,
     /// Print the change log.
@@ -226,8 +229,23 @@ struct ChangelogArgs {
 
 #[derive(Args)]
 struct TugasArgs {
+    /// Only this course (substring of the course name, case-insensitive)
+    #[arg(long)]
+    course: Option<String>,
+    /// Only unsubmitted items (nearest deadline first)
+    #[arg(long)]
+    pending: bool,
     #[command(subcommand)]
     cmd: Option<TugasCmd>,
+}
+
+#[derive(Args)]
+struct MateriArgs {
+    /// Only this course (substring of the course name, case-insensitive)
+    #[arg(long)]
+    course: Option<String>,
+    #[command(subcommand)]
+    cmd: Option<MateriCmd>,
 }
 
 #[derive(Subcommand)]
@@ -242,6 +260,18 @@ enum TugasCmd {
         /// Finalize the submission (Submit assignment) instead of saving a draft
         #[arg(long)]
         submit: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum MateriCmd {
+    /// Download one material (unique substring of its name or URL) into DIR
+    Download {
+        /// Substring matching the material name or URL (must match exactly one)
+        query: String,
+        /// Destination directory (created when missing; default: current dir)
+        #[arg(long)]
+        out: Option<String>,
     },
 }
 
@@ -296,7 +326,7 @@ fn run(cli: Cli) -> Result<()> {
             WatchCmd::List => watch_list(&home, cli.json),
             WatchCmd::Add { id, url, selector, interval, key_field, render, sso_app, pre_url, link_selector, sso_semester } => {
                 watch::add_page(&home, &id, &url, selector, interval, key_field, render, sso_app, pre_url, link_selector, sso_semester)?;
-                println!("page '{id}' added; run: unnes watch run --page_id {id}");
+                println!("page '{id}' added; run: unnes watch run --page-id {id}");
                 Ok(())
             }
             WatchCmd::Rm { id } => {
@@ -312,8 +342,12 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Kurikulum => cmd_kurikulum(&home, &profile, cli.json),
         Cmd::Jadwal => cmd_jadwal(&home, &profile, cli.json),
         Cmd::Tugas(a) => match a.cmd {
-            None => cmd_tugas(&home, &profile, cli.json),
+            None => cmd_tugas(&home, &profile, a.course.as_deref(), a.pending, cli.json),
             Some(TugasCmd::Submit { cmid, file, submit }) => cmd_tugas_submit(&home, &profile, cmid, &file, submit, cli.json),
+        },
+        Cmd::Materi(a) => match &a.cmd {
+            None => cmd_materi_list(&home, &profile, a.course.as_deref(), cli.json),
+            Some(MateriCmd::Download { query, out }) => cmd_materi_download(&home, &profile, query, out.as_deref(), cli.json),
         },
         Cmd::Tui => tui::run(&home, &profile),
         Cmd::Changelog(a) => changelog_list(&home, &a, cli.json),
@@ -324,8 +358,38 @@ fn run(cli: Cli) -> Result<()> {
 fn err_code_for(code: &str) -> u8 {
     match code {
         "usage" | "contract" => 2,
-        "network" | "timeout" | "challenge" => 5,
+        "network" | "timeout" | "challenge" | "ratelimit" => 5,
         _ => 1,
+    }
+}
+
+/// Exit code for fetch-family failures from the full message: session lapses
+/// -> 4, transport/challenge -> 5, everything else -> 1. Transport errors must
+/// never masquerade as "re-login" (exit 4), and session lapses must never
+/// hide as generic errors (exit 1) - both mislabelings were systemic.
+fn exit_for_fetch_fail(msg: &str) -> u8 {
+    let m = msg.to_lowercase();
+    if m.contains("session expired")
+        || m.contains("session unavailable")
+        || m.contains("(session)")
+        || m.contains("needsinteraction")
+        || m.contains("needs interaction")
+    {
+        4
+    } else if m.contains("timed out")
+        || m.contains("timeout")
+        || m.contains("network")
+        || m.contains("challenge")
+        || m.contains("cloudflare")
+        || m.contains("connection")
+        || m.contains("(timeout)")
+        || m.contains("(challenge)")
+        || m.contains("http 4")
+        || m.contains("http 5")
+    {
+        5
+    } else {
+        1
     }
 }
 
@@ -353,8 +417,14 @@ fn cmd_login(home: &UnnesHome, profile: &str) -> Result<()> {
         "landing_url": res.landing_url,
         "logged_in_at": chrono::Utc::now().to_rfc3339(),
     });
-    fs::write(home.profile_meta_file(profile), serde_json::to_string_pretty(&meta)?)?;
+    crate::changelog::write_atomic(&home.profile_meta_file(profile), serde_json::to_string_pretty(&meta)?.as_bytes())?;
     println!("logged in (profile {profile}), {} cookies captured", res.captured_cookies.unwrap_or(0));
+    if res.google_persistent == Some(0) {
+        println!("WARNING: Google sign-in will NOT persist (no persistent SID-family cookie kept).");
+        println!("Next login will show an empty account chooser. Fix now: re-run unnes login,");
+        println!("sign into the accounts.google.com tab first with 'Stay signed in', then click");
+        println!("'Login dengan UNNES-ID' - and let unnes close the window itself.");
+    }
     if let Some(landing) = &res.landing_url {
         println!("SSO landing page: {landing}");
         println!("point a watch at it: unnes watch add <id> --url={landing} --selector=<css>");
@@ -371,7 +441,7 @@ fn cmd_logout(home: &UnnesHome, profile: &str) -> Result<()> {
         return Err(app_err(err_code_for(&code), format!("logout failed: {}", err_msg(&res))));
     }
     let _ = fs::remove_file(home.profile_meta_file(profile));
-    println!("session cleared (profile {profile})");
+    println!("local session cleared (profile {profile}); server sessions expire on their own");
     Ok(())
 }
 
@@ -389,8 +459,11 @@ fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
     let age_secs = SystemTime::now().duration_since(modified).unwrap_or_default().as_secs();
 
     // Live session check: the gateway answers the app list only with a valid
-    // server-side session; jar-file existence alone is not proof.
+    // server-side session; jar-file existence alone is not proof. Elena gets
+    // its own probe (same as the TUI): its Moodle session outlives the
+    // gateway one, so gateway-dead + elena-alive is not "logged out".
     let mut valid = false;
+    let mut elena_valid = false;
     let mut probe_err = String::new();
     {
         let mut job = fetcher::job("get", profile);
@@ -404,6 +477,13 @@ fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
             }
             Err(e) => probe_err = format!("{e:#}"),
         }
+        if !valid {
+            let mut ejob = fetcher::job("get", profile);
+            ejob["url"] = json!("https://elena.unnes.ac.id/my/");
+            if let Ok(res) = fetcher::run_job(home, profile, ejob) {
+                elena_valid = res.ok && !res.session_expired;
+            }
+        }
     }
     let meta_path = home.profile_meta_file(profile);
     let landing: Option<String> = if meta_path.is_file() {
@@ -413,9 +493,12 @@ fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
     } else {
         None
     };
-    // Auto re-login for status: try the scripted login before declaring EXPIRED.
-    if !valid && cfg.general.auto_relogin {
-        probe_err = match watch::auto_login(home, profile, true) {
+    // Auto re-login for status: scripted attempt only (non-interactive) - a
+    // read-only probe must never pop a click-waiting browser window.
+    // Skipped when Elena is alive: its session usually survives the gateway
+    // lapse and most commands self-heal from it.
+    if !valid && !elena_valid && cfg.general.auto_relogin {
+        probe_err = match watch::auto_login(home, profile, false) {
             Ok(how) => format!("re-login ok ({how})"),
             Err(e) => format!("auto re-login failed: {e:#}"),
         };
@@ -428,7 +511,7 @@ fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
             }
         }
     }
-    if !valid {
+    if !valid && !elena_valid {
         if json_out {
             println!("{}", serde_json::to_string_pretty(&json!({
                 "profile": profile,
@@ -448,10 +531,15 @@ fn cmd_status(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
             "logged_in": true,
             "jar_age_seconds": age_secs,
             "landing_url": landing,
+            "elena": elena_valid,
         }))?);
     } else {
         println!("profile: {profile}");
-        println!("session: VALID (gateway confirmed)");
+        if valid {
+            println!("session: VALID (gateway confirmed)");
+        } else {
+            println!("session: PARTIAL (gateway ended, Elena alive - most commands self-heal)");
+        }
         match landing {
             Some(l) => println!("SSO landing: {l}"),
             None => println!("SSO landing: unknown (re-run unnes login)"),
@@ -625,8 +713,7 @@ fn cmd_kurikulum(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> 
     let nim = kurikulum::resolve_nim(home)
         .ok_or_else(|| app_err(1, "cannot determine NIM - set [general] nim in config or run unnes watch run first (biodata)"))?;
     let kursus = kurikulum::fetch_and_parse(home, profile, &nim, true).map_err(|e| match format!("{e:#}") {
-        m if m.contains("session unavailable") || m.contains("session expired") => app_err(4, format!("kurikulum: {m}")),
-        m => app_err(1, format!("kurikulum: {m}")),
+        m => app_err(exit_for_fetch_fail(&m), format!("kurikulum: {m}")),
     })?;
 
     if json_out {
@@ -675,8 +762,7 @@ fn cmd_jadwal(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
     let nim = kurikulum::resolve_nim(home)
         .ok_or_else(|| app_err(1, "cannot determine NIM - set [general] nim in config or run unnes watch run first (biodata)"))?;
     let (sesi, info) = jadwal::fetch_and_parse(home, profile, &nim, true).map_err(|e| match format!("{e:#}") {
-        m if m.contains("session unavailable") || m.contains("session expired") => app_err(4, format!("jadwal: {m}")),
-        m => app_err(1, format!("jadwal: {m}")),
+        m => app_err(exit_for_fetch_fail(&m), format!("jadwal: {m}")),
     })?;
     if sesi.is_empty() {
         return Err(app_err(1, "jadwal: no sessions parsed - the KRS form may be empty or changed"));
@@ -704,34 +790,199 @@ fn cmd_jadwal(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
     Ok(())
 }
 
-/// unnes tugas: Elena assignments + quizzes across all courses, with due
-/// dates and submission status. New items appear here the moment the
-/// professor adds them (the watch crawl also logs them as changes).
-fn cmd_tugas(home: &UnnesHome, profile: &str, json_out: bool) -> Result<()> {
+/// unnes tugas: course picker first, then the must-submit popup.
+///
+/// No flags: print the mata kuliah list (total/belum per course) plus the
+/// HARUS DIKUMPULKAN popup - unsubmitted items nearest deadline first, with
+/// urgency warnings. --course selects one course, --pending lists only the
+/// unsubmitted items. --json keeps the flat item array (filtered).
+fn cmd_tugas(home: &UnnesHome, profile: &str, course: Option<&str>, pending_only: bool, json_out: bool) -> Result<()> {
     let items = tugas::fetch_items(home, profile, true).map_err(|e| match format!("{e:#}") {
-        m if m.contains("session unavailable") => app_err(4, format!("tugas: {m}")),
-        m => app_err(1, format!("tugas: {m}")),
+        m => app_err(exit_for_fetch_fail(&m), format!("tugas: {m}")),
     })?;
 
+    let mut view: Vec<&tugas::TugasItem> = items.iter().collect();
+    if let Some(f) = course {
+        view = tugas::filter_course(&items, f);
+        if view.is_empty() {
+            println!("tidak ada matakuliah/tugas yang cocok dengan '{f}'. Pilihan:");
+            for (c, t, p) in tugas::courses(&items) {
+                println!("  {c} ({t} tugas, {p} belum)");
+            }
+            return Ok(());
+        }
+    }
+    if pending_only {
+        view.retain(|it| tugas::is_pending(it));
+    }
+
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&items)?);
+        println!("{}", serde_json::to_string_pretty(&view)?);
         return Ok(());
     }
     if items.is_empty() {
         println!("Belum ada tugas/kuis di Elena - item baru akan muncul di sini begitu dosen menambahkannya.");
         return Ok(());
     }
-    println!("=== TUGAS & KUIS ELENA ({} item) ===", items.len());
-    for it in &items {
+    if course.is_some() || pending_only {
+        print_tugas_list(&view);
+        return Ok(());
+    }
+    // Default: pick a course first, then the must-submit popup.
+    println!("=== MATA KULIAH ({} matakuliah, {} tugas) ===", tugas::courses(&items).len(), items.len());
+    for (c, t, p) in tugas::courses(&items) {
+        let mark = if p > 0 { format!("{p} BELUM") } else { "lengkap".to_string() };
+        println!("  {:<34} {:>2} tugas  [{mark}]", c, t);
+    }
+    println!();
+    println!("  lihat satu matakuliah: unnes tugas --course <nama>");
+    println!();
+    print_tugas_popup(&items);
+    Ok(())
+}
+
+fn tugas_due(it: &tugas::TugasItem) -> &str {
+    if it.due.is_empty() { "-" } else { &it.due }
+}
+
+/// The HARUS DIKUMPULKAN popup: unsubmitted items nearest deadline first.
+fn print_tugas_popup(items: &[tugas::TugasItem]) {
+    let pending = tugas::pending_sorted(items);
+    if pending.is_empty() {
+        println!("=== HARUS DIKUMPULKAN: tidak ada - semua sudah dikumpulkan. ===");
+        return;
+    }
+    println!("=== HARUS DIKUMPULKAN ({} item, deadline terdekat dulu) ===", pending.len());
+    for (i, it) in pending.iter().take(15).enumerate() {
+        let u = tugas::urgency(it);
+        let warn = tugas::urgency_mark(u);
+        let status = if it.status.is_empty() { "-" } else { &it.status };
+        println!("{}. [{}] {} ({})", i + 1, if warn.is_empty() { "jadwal" } else { warn }, it.nama, it.course);
+        println!("   {} | {} | due: {} | status: {} ({})", it.kategori, it.course, tugas_due(it), status, it.url);
+    }
+    if pending.len() > 15 {
+        println!("   ... dan {} lagi (unnes tugas --pending untuk semua)", pending.len() - 15);
+    }
+}
+
+fn print_tugas_list(view: &[&tugas::TugasItem]) {
+    if view.is_empty() {
+        println!("tidak ada item yang cocok.");
+        return;
+    }
+    println!("=== TUGAS & KUIS ({} item) ===", view.len());
+    for it in view {
+        let u = tugas::urgency(it);
+        let warn = tugas::urgency_mark(u);
         let mark = match it.status.as_str() {
             "Submitted" => "OK dikumpulkan",
-            "Belum dikumpulkan" | "Draft" => "!! BELUM",
+            "Belum dikumpulkan" | "Draft" => "BELUM",
             _ => if it.status.is_empty() { "?" } else { "?" },
         };
-        println!("[{}] {}
-   course {} | {} | due: {} | status: {} ({})", mark, it.nama, it.course, it.kategori, if it.due.is_empty() { "-" } else { &it.due }, if it.status.is_empty() { "-" } else { &it.status }, it.url);
+        let status = if it.status.is_empty() { "-" } else { &it.status };
+        println!("[{mark}] {}{}\n   course {} | {} | due: {} | status: {} ({})",
+            it.nama,
+            if warn.is_empty() || u == tugas::Urgency::Done { String::new() } else { format!("  <-- {warn}") },
+            it.course, it.kategori, tugas_due(it), status, it.url);
+    }
+}
+
+/// unnes materi: list course materials (files/resources lecturers uploaded).
+fn cmd_materi_list(home: &UnnesHome, profile: &str, course: Option<&str>, json_out: bool) -> Result<()> {
+    let items = crate::materi::fetch_materi(home, profile, true).map_err(|e| match format!("{e:#}") {
+        m => app_err(exit_for_fetch_fail(&m), format!("materi: {m}")),
+    })?;
+    let view: Vec<&crate::materi::MateriItem> = match course {
+        Some(f) => crate::materi::filter_course(&items, f),
+        None => items.iter().collect(),
+    };
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&view)?);
+        return Ok(());
+    }
+    if items.is_empty() {
+        println!("Belum ada materi di Elena.");
+        return Ok(());
+    }
+    if view.is_empty() {
+        println!("tidak ada materi yang cocok. Pilihan matakuliah:");
+        for (c, n) in crate::materi::courses(&items) {
+            println!("  {c} ({n} materi)");
+        }
+        return Ok(());
+    }
+    if course.is_none() {
+        println!("=== MATERI ({} file, {} matakuliah) ===", view.len(), crate::materi::courses(&items).len());
+        for (c, n) in crate::materi::courses(&items) {
+            println!("  {c:<34} {n} materi");
+        }
+        println!();
+        println!("  lihat satu matakuliah: unnes materi --course <nama>");
+        println!("  download: unnes materi download <nama-file> --out <dir>");
+        return Ok(());
+    }
+    let mut last_course = String::new();
+    for it in &view {
+        if it.course != last_course {
+            last_course = it.course.clone();
+            println!("=== {} ===", it.course);
+        }
+        println!("  [{:<8}] {}\n             {}", it.kind, it.nama, it.url);
+    }
+    println!();
+    println!("  download: unnes materi download <nama-file> --out <dir>");
+    Ok(())
+}
+
+/// unnes materi download <query> [--out DIR]: save one material to disk.
+fn cmd_materi_download(home: &UnnesHome, profile: &str, query: &str, out: Option<&str>, json_out: bool) -> Result<()> {
+    let items = crate::materi::fetch_materi(home, profile, true).map_err(|e| match format!("{e:#}") {
+        m => app_err(exit_for_fetch_fail(&m), format!("materi: {m}")),
+    })?;
+    let q = query.to_lowercase();
+    let hits: Vec<&crate::materi::MateriItem> = items
+        .iter()
+        .filter(|it| it.nama.to_lowercase().contains(&q) || it.url.to_lowercase().contains(&q))
+        .collect();
+    if hits.is_empty() {
+        return Err(app_err(1, format!("tidak ada materi yang cocok dengan '{query}' (coba: unnes materi)")));
+    }
+    if hits.len() > 1 {
+        println!("'{query}' cocok dengan {} materi - persempit lagi:", hits.len());
+        for it in hits.iter().take(15) {
+            println!("  [{}] {} ({})", it.kind, it.nama, it.course);
+        }
+        return Err(app_err(2, format!("query ambigu: '{query}' cocok dengan {} materi", hits.len())));
+    }
+    let item = hits[0];
+    let out_dir = out.map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("."));
+    let saved = crate::materi::download_materi(home, profile, item, &out_dir)?;
+    let size = std::fs::metadata(&saved).map(|m| m.len()).unwrap_or(0);
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "nama": item.nama,
+            "course": item.course,
+            "path": saved.to_string_lossy(),
+            "bytes": size,
+        }))?);
+    } else {
+        println!("tersimpan: {} ({})\n  {} [{}]", saved.display(), human_size(size), item.nama, item.course);
     }
     Ok(())
+}
+
+/// Human file size (never "0 KB" for a real file).
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 fn cmd_discover(home: &UnnesHome, profile: &str, args: &DiscoverArgs, json_out: bool) -> Result<()> {
@@ -826,6 +1077,8 @@ fn cmd_watch_run(home: &UnnesHome, profile: &str, only: Option<&str>, json_out: 
         return Ok(());
     }
     let mut had_session_error = false;
+    let mut had_selector_error = false;
+    let mut had_error = false;
     for o in &outcomes {
         if json_out {
             println!("{}", serde_json::to_string(&serde_json::json!({
@@ -834,13 +1087,20 @@ fn cmd_watch_run(home: &UnnesHome, profile: &str, only: Option<&str>, json_out: 
                 "summary": o.summary,
             }))?);
         } else {
-            let mark = if o.changed { "CHANGED" } else { "ok" };
-            println!("[{}] {} {}", o.page_id, mark, o.summary);
+            println!("[{}] {} {}", o.page_id, watch::outcome_mark(o), o.summary);
         }
         if o.summary.contains("session expired") { had_session_error = true; }
+        if o.selector_empty { had_selector_error = true; }
+        if o.summary.starts_with("ERROR") { had_error = true; }
     }
     if had_session_error {
         return Err(app_err(4, "session expired for one or more pages; run: unnes login"));
+    }
+    if had_selector_error {
+        return Err(app_err(6, "selector matched nothing for one or more pages - the page may have changed"));
+    }
+    if had_error {
+        return Err(app_err(1, "one or more pages errored (see ERROR lines above)"));
     }
     Ok(())
 }
@@ -901,6 +1161,12 @@ fn changelog_list(home: &UnnesHome, args: &ChangelogArgs, json: bool) -> Result<
 /// unnes tugas submit <cmid> --file=<path> [--submit]
 /// Upload a file to an Elena assignment (mod/assign/view.php?id=<cmid>).
 /// Default saves a draft; --submit finalizes the submission.
+///
+/// Retry policy (bounded, max 3 submit attempts): an expired session triggers
+/// one auto re-login + retry (existing self-healing); transient failures
+/// (network/timeout, profile lock held by another op) back off 2s/5s and
+/// retry. Deterministic errors (bad file, no file input on the page) fail
+/// fast with a diagnosed cause instead of a bare fetcher message.
 fn cmd_tugas_submit(home: &UnnesHome, profile: &str, cmid: u32, file: &str, finalize: bool, json_out: bool) -> Result<()> {
     if !home.profile_jar_file(profile).is_file() {
         return Err(app_err(3, format!("not logged in (profile {profile}); run: unnes login")));
@@ -909,29 +1175,57 @@ fn cmd_tugas_submit(home: &UnnesHome, profile: &str, cmid: u32, file: &str, fina
     if !path.is_file() {
         return Err(app_err(1, format!("file not found: {file}")));
     }
-    let mut job = fetcher::job("submit", profile);
-    job["url"] = json!(format!("https://elena.unnes.ac.id/mod/assign/view.php?id={cmid}"));
-    job["file"] = json!(file);
-    job["action"] = json!(if finalize { "submit" } else { "draft" });
-    job["ssoApp"] = json!("30");
-    job["semester"] = json!(tugas::configured_elena_semester(home).unwrap_or_else(|| "20261".into()));
-    let mut res = fetcher::run_job(home, profile, job.clone())?;
-    // Self-healing submit: expired session -> auto re-login (scripted with the
-    // saved profile; escalates to a one-click window only if Google insists on
-    // a human) -> one retry. Same pattern as the fetch path.
-    if !res.ok && res.session_expired {
-        if let Ok(cfg) = Config::load(home) {
-            if cfg.general.auto_relogin {
-                eprintln!("session expired; auto re-login...");
-                if watch::auto_login(home, profile, true).is_ok() {
-                    res = fetcher::run_job(home, profile, job)?;
+    let semester = tugas::configured_elena_semester(home).unwrap_or_else(|| "20261".into());
+    let max_attempts = 3u32;
+    let mut attempt = 0u32;
+    let mut did_session_retry = false;
+    let res = loop {
+        attempt += 1;
+        let mut job = fetcher::job("submit", profile);
+        job["url"] = json!(format!("https://elena.unnes.ac.id/mod/assign/view.php?id={cmid}"));
+        job["file"] = json!(file);
+        job["action"] = json!(if finalize { "submit" } else { "draft" });
+        job["ssoApp"] = json!("30");
+        job["semester"] = json!(semester);
+        let res = fetcher::run_job(home, profile, job)?;
+        if res.ok {
+            break res;
+        }
+        let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
+        let msg = res.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+        // Expired session -> auto re-login (scripted with the saved profile;
+        // one-click window only if Google insists) -> immediate retry, once.
+        if res.session_expired && !did_session_retry {
+            if let Ok(cfg) = Config::load(home) {
+                if cfg.general.auto_relogin {
+                    eprintln!("session expired; auto re-login...");
+                    if watch::auto_login(home, profile, true).is_ok() {
+                        did_session_retry = true;
+                        continue;
+                    }
                 }
             }
         }
-    }
+        if attempt < max_attempts && is_retryable_submit(&code, &msg) {
+            let wait = if attempt == 1 { 2 } else { 5 };
+            eprintln!("submit attempt {attempt} failed ({code}): {msg}; retrying in {wait}s...");
+            std::thread::sleep(std::time::Duration::from_secs(wait));
+            continue;
+        }
+        break res;
+    };
     if !res.ok {
         let code = res.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
-        return Err(app_err(err_code_for(&code), format!("submit: {}", err_msg(&res))));
+        let msg = res.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+        // Session exhaustion must exit 4 (not generic 1) so scripts/cron can
+        // tell "re-login" apart from other failures.
+        let exit = if code == "session" || res.session_expired { 4 } else { err_code_for(&code) };
+        return Err(app_err(exit, format!("submit: {}", diagnose_submit(&code, &msg))));
+    }
+    // The upload ran but the page shows no proof: warn instead of claiming
+    // success so the user verifies on the web instead of assuming.
+    if !res.submitted && !res.draft && !res.has_file {
+        eprintln!("WARNING: upload finished but no submission state could be verified on the page - open the assignment to confirm.");
     }
     let message = res.message.clone().unwrap_or_else(|| "ok".into());
     if json_out {
@@ -941,9 +1235,109 @@ fn cmd_tugas_submit(home: &UnnesHome, profile: &str, cmid: u32, file: &str, fina
             "file": file,
             "action": if finalize { "submit" } else { "draft" },
             "message": message,
+            "submitted": res.submitted,
+            "draft": res.draft,
+            "has_file": res.has_file,
         }))?);
     } else {
         println!("tugas {cmid}: {message}");
     }
     Ok(())
+}
+
+/// Retryable submit failures: transient transport problems and a profile lock
+/// held by a concurrent op. Everything else (bad cmid, closed form, missing
+/// file input) is deterministic - retrying would just burn minutes.
+fn is_retryable_submit(code: &str, msg: &str) -> bool {
+    if code == "network" || code == "timeout" || code == "challenge" {
+        return true;
+    }
+    let m = msg.to_lowercase();
+    if m.contains("profile in use") || m.contains("profile locked") || m.contains("already in use") {
+        return true;
+    }
+    if code == "internal"
+        && (m.contains("timeout")
+            || m.contains("timed out")
+            || m.contains("navigation")
+            || m.contains("net::")
+            || m.contains("protocol")
+            || m.contains("closed")
+            || m.contains("crash"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Turn a bare fetcher error into a diagnosed cause with a next action.
+fn diagnose_submit(code: &str, msg: &str) -> String {
+    let base = format!("{msg} ({code})");
+    let m = msg.to_lowercase();
+    let hint = if code == "session" {
+        "the portal session lapsed and auto re-login did not recover it - run: unnes login, then retry"
+    } else if m.contains("could not attach") {
+        "the assignment shows no file input - it may already be finalized, past due (form closed), or the cmid is wrong - open the assignment URL to check"
+    } else if m.contains("profile in use") || m.contains("locked") || m.contains("already in use") {
+        "another unnes browser operation is holding the profile - wait ~1 min and retry"
+    } else if code == "network" || code == "timeout" || code == "challenge" || m.contains("timeout") {
+        "transient network/timeout talking to Elena and retries are exhausted - check your connection and retry"
+    } else if m.contains("no_browser") || m.contains("unnes_no_browser") {
+        "browser operations are disabled (UNNES_NO_BROWSER is set) - unset it to submit"
+    } else {
+        ""
+    };
+    if hint.is_empty() {
+        base
+    } else {
+        format!("{base} - {hint}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submit_retries_transient_but_not_deterministic_errors() {
+        assert!(is_retryable_submit("network", "page render failed: net::ERR_TIMEOUT"));
+        assert!(is_retryable_submit("timeout", "waiting timed out"));
+        assert!(is_retryable_submit("internal", "submit failed at stage 'open': Navigation timeout exceeded"));
+        assert!(is_retryable_submit("usage", "profile in use by another unnes instance"));
+        assert!(!is_retryable_submit("usage", "could not attach the file at stage 'attach': no file input"));
+        assert!(!is_retryable_submit("usage", "file not found: /tmp/x.pdf"));
+        assert!(!is_retryable_submit("session", "gateway session expired at stage 'prime'"));
+        assert!(!is_retryable_submit("internal", "submit failed at stage 'verify': unexpected bug"));
+    }
+
+    #[test]
+    fn submit_errors_carry_a_diagnosed_cause() {
+        assert!(diagnose_submit("session", "session expired at stage 'open'").contains("unnes login"));
+        assert!(diagnose_submit("usage", "could not attach the file at stage 'attach'").contains("finalized"));
+        assert!(diagnose_submit("network", "boom").contains("retries are exhausted"));
+        assert!(diagnose_submit("internal", "submit failed at stage 'open': Navigation timeout").contains("retries are exhausted"));
+        // Unknown errors pass through undiagnosed rather than misdiagnosed.
+        assert_eq!(diagnose_submit("usage", "mystery"), "mystery (usage)");
+    }
+
+    #[test]
+    fn fetch_failures_map_to_the_right_exit_code() {
+        assert_eq!(exit_for_fetch_fail("elena session unavailable; run: unnes login"), 4);
+        assert_eq!(exit_for_fetch_fail("gateway session expired at stage 'prime'"), 4);
+        assert_eq!(exit_for_fetch_fail("boom (session)"), 4);
+        assert_eq!(exit_for_fetch_fail("page render failed: net::ERR_TIMEOUT"), 5);
+        assert_eq!(exit_for_fetch_fail("download failed with HTTP 403 for https://x"), 5);
+        assert_eq!(exit_for_fetch_fail("Cloudflare challenge; backing off"), 5);
+        assert_eq!(exit_for_fetch_fail("boom (network)"), 5);
+        assert_eq!(exit_for_fetch_fail("mystery"), 1);
+    }
+
+    #[test]
+    fn human_sizes() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(500), "500 B");
+        assert_eq!(human_size(1024), "1 KB");
+        assert_eq!(human_size(104629), "102 KB");
+        assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
+    }
 }

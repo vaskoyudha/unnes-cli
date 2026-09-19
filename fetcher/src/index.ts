@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { CookieJar } from "./cookiejar.js";
 import { HttpFetcher } from "./http.js";
+import { PoliteLimiter } from "./polite.js";
 import { LoginForm, opLogin, opLogout } from "./login.js";
 import { normalizeHtml } from "./normalize.js";
 import { ExtractSpec, extractRecords } from "./extract.js";
@@ -13,7 +14,7 @@ process.env.NODE_NO_WARNINGS = "1";
 
 export interface Job {
   contract: number;
-  op: "get" | "login" | "logout" | "sso" | "page" | "crawl" | "batch" | "submit" | "open";
+  op: "get" | "login" | "logout" | "sso" | "page" | "crawl" | "batch" | "submit" | "open" | "download" | "batchget";
   profile?: string;
   /** used by login/logout when the job URL family is not explicit */
   baseUrl?: string;
@@ -42,6 +43,8 @@ export interface Job {
   semester?: string;
   /** op=submit: file to upload to an Elena assignment (absolute path) */
   file?: string;
+  /** op=download: directory the downloaded file is saved into */
+  out?: string;
   /** op=submit: "draft" (default) or "submit" (finalize) */
   action?: "draft" | "submit";
   /** op=open: max ms to keep the profile browser window open (default 10 min) */
@@ -55,6 +58,16 @@ export interface Job {
     extract?: ExtractSpec;
     waitMs?: number;
   }[];
+  /** op=batchget: plain-HTTP GETs served in one spawn sharing one jar.
+   * Per entry: url + optional extract/extraRegexes. `concurrency` caps
+   * in-flight data GETs (default 1 until the pool lands; prime/SSO passes
+   * always run sequentially). */
+  urls?: {
+    url: string;
+    extract?: ExtractSpec;
+    extraRegexes?: string[];
+  }[];
+  concurrency?: number;
 }
 
 export interface JobResult {
@@ -68,9 +81,15 @@ function fail(code: string, message: string): JobResult {
   return { contract: CONTRACT, ok: false, error: { code, message } };
 }
 
-async function envPaths(): Promise<{ profilePath: string; browserDir: string }> {
-  const home = process.env.UNNES_HOME ?? join(process.env.HOME ?? ".", ".config", "unnes");
-  const profile = process.env.UNNES_PROFILE ?? "default";
+async function envPaths(jobProfile?: string): Promise<{ profilePath: string; browserDir: string }> {
+  // Resolution mirrors the Rust side (UNNES_HOME > XDG_CONFIG_HOME/unnes >
+  // ~/.config/unnes). The job envelope ALSO carries `profile`: env wins when
+  // set (the CLI always injects it), the job field is the fallback so direct
+  // node callers address the intended profile instead of "default".
+  const home = process.env.UNNES_HOME
+    ?? (process.env.XDG_CONFIG_HOME ? join(process.env.XDG_CONFIG_HOME, "unnes") : null)
+    ?? join(process.env.HOME ?? ".", ".config", "unnes");
+  const profile = process.env.UNNES_PROFILE ?? jobProfile ?? "default";
   return {
     profilePath: join(home, "profiles", profile + ".json"),
     // Persistent Chromium profile: keeps the Google sign-in state (account
@@ -93,7 +112,7 @@ async function refreshAppSession(
 
 export async function processJob(job: Job): Promise<JobResult> {
   if (job.contract !== CONTRACT) return fail("contract", "unsupported contract version " + String(job.contract));
-  const { profilePath, browserDir } = await envPaths();
+  const { profilePath, browserDir } = await envPaths(job.profile);
   const ua = process.env.UNNES_USER_AGENT ?? "unnes-cli/0.1";
   const baseUrl = (job.baseUrl ?? DEFAULT_BASE).replace(/\/+$/, "");
 
@@ -105,6 +124,11 @@ export async function processJob(job: Job): Promise<JobResult> {
         const f = new HttpFetcher(jar, ua);
         const res = await f.request({ method: "GET", url: job.url! });
         if (res.fetchError) return fail(res.fetchError.code, res.fetchError.message);
+        // Persist slides/rotations from plain HTTP too (previously only
+        // browser/sso paths saved, so sliding sessions looked expired early).
+        // Skipped on expiry: the jar was rolled back to pre-request state and
+        // saving would only rewrite it.
+        if (!res.sessionExpired) await jar.save(profilePath);
         const records = job.extract ? extractRecords(res.html, job.extract) : [];
         const normalized = normalizeHtml(res.html, job.extraRegexes ?? []);
         return {
@@ -128,11 +152,81 @@ export async function processJob(job: Job): Promise<JobResult> {
                 retry.ssoRefreshed = true;
                 return retry;
               }
+            } else {
+              // Don't swallow the refresh cause: without it every downstream
+              // failure looks like a plain expiry with no remediation trail.
+              (result as Record<string, unknown>).ssoRefreshError =
+                refreshed.code + ": " + refreshed.message;
             }
           }
-        } catch { /* fall through to the original result */ }
+        } catch (e) {
+          (result as Record<string, unknown>).ssoRefreshError =
+            "refresh attempt failed: " + (e instanceof Error ? e.message : String(e)).slice(0, 200);
+        }
       }
       return result;
+    }
+    case "batchget": {
+      if (!job.urls || job.urls.length === 0) return fail("usage", "op=batchget requires urls[]");
+      const conc = Math.max(1, Math.floor(job.concurrency ?? 1));
+      if (conc > 1) console.error("[batchget] concurrency>1 ignored until the pool lands (phase 3); running sequentially");
+      // One jar, one limiter, one save for the whole batch: N URLs for the
+      // price of one node spawn, with keep-alive reuse inside the process.
+      const polite = new PoliteLimiter();
+      let jar = await CookieJar.load(profilePath);
+      let f = new HttpFetcher(jar, ua, undefined, polite);
+      const runGet = async (entry: { url: string; extract?: ExtractSpec; extraRegexes?: string[] }): Promise<JobResult> => {
+        const res = await f.request({ method: "GET", url: entry.url });
+        if (res.fetchError) return { url: entry.url, ok: false, error: { code: res.fetchError.code, message: res.fetchError.message } };
+        const records = entry.extract ? extractRecords(res.html, entry.extract) : [];
+        const normalized = normalizeHtml(res.html, entry.extraRegexes ?? []);
+        return {
+          url: entry.url, ok: true, status: res.status, finalUrl: res.finalUrl,
+          sessionExpired: res.sessionExpired, challenge: res.challenge, retryAfter: res.retryAfter,
+          records, normalized,
+        };
+      };
+      const { appForHost } = await import("./sso.js");
+      const results: JobResult[] = [];
+      for (const entry of job.urls) {
+        let r = await runGet(entry);
+        // Auto SSO bootstrap per expired entry (same rule as op=get): the
+        // refresh rewrites the jar on disk, so reload our in-memory view
+        // before retrying - saving the stale view later would clobber it.
+        if (r.ok && r.sessionExpired === true) {
+          try {
+            const cfg = appForHost(new URL(entry.url).hostname);
+            if (cfg) {
+              const refreshed = await refreshAppSession(profilePath, baseUrl, cfg.appId);
+              if (refreshed.ok) {
+                jar = await CookieJar.load(profilePath);
+                f = new HttpFetcher(jar, ua, undefined, polite);
+                r = await runGet(entry);
+                if (r.ok && r.sessionExpired !== true) {
+                  (r as Record<string, unknown>).ssoRefreshed = true;
+                }
+              } else {
+                (r as Record<string, unknown>).ssoRefreshError =
+                  refreshed.code + ": " + refreshed.message;
+              }
+            }
+          } catch (e) {
+            (r as Record<string, unknown>).ssoRefreshError =
+              "refresh attempt failed: " + (e instanceof Error ? e.message : String(e)).slice(0, 200);
+          }
+        }
+        results.push(r);
+      }
+      // Same save rule as op=get: skipped only when every entry expired
+      // (the jar was rolled back to pre-request state; saving rewrites it).
+      if (results.some((r) => r.ok === true && (r as Record<string, unknown>).sessionExpired !== true)) {
+        await jar.save(profilePath);
+      }
+      return {
+        contract: CONTRACT, op: "batchget", ok: true,
+        sessionExpired: results.some((r) => (r as Record<string, unknown>).sessionExpired === true),
+        results,
+      };
     }
     case "sso": {
       if (!job.appId) return fail("usage", "op=sso requires appId");
@@ -182,6 +276,13 @@ export async function processJob(job: Job): Promise<JobResult> {
         semester: job.semester,
         waitMs: job.waitMs,
       });
+    }
+    case "download": {
+      if (!job.url || !job.out) {
+        return fail("usage", "op=download requires url and out (directory)");
+      }
+      const { opDownload } = await import("./download.js");
+      return opDownload(profilePath, ua, job.url, job.out);
     }
     case "crawl": {
       if (!job.url || !job.linkSelector || !job.extract) {

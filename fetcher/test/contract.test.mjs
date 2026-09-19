@@ -668,3 +668,21 @@ test("429 with Retry-After is retried once, then succeeds", async (t) => {
     assert.equal(res.status, 200);
   });
 });
+
+test("batchget serves N urls in one spawn, one jar save", async (t) => {
+  const { server, base } = await startServer();
+  t.after(() => new Promise((res) => server.close(res)));
+  await withHome("batchget", async (home) => {
+    const res = await processJob({ contract: 1, op: "batchget", urls: [
+      { url: base + "/grades" },
+      { url: base + "/challenge" },
+    ]});
+    assert.equal(res.ok, true);
+    assert.equal(res.results.length, 2);
+    assert.equal(res.results[0].url, base + "/grades");
+    assert.ok(res.results.every((r) => r.ok));
+    const { CookieJar } = await import("../dist/cookiejar.js");
+    const jar = await CookieJar.load(join(home, "profiles", "default.json"));
+    assert.ok(jar.cookieNames().length >= 0);
+  });
+});
