@@ -21,6 +21,7 @@ function startServer() {
   let hits429 = 0;
   let inflightSlow = 0;
   let peakSlow = 0;
+  let imgHits = 0;
   const server = createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     const cookie = req.headers.cookie ?? "";
@@ -99,6 +100,16 @@ function startServer() {
       res.end("<html><body>version one</body></html>");
       return;
     }
+    if (url.pathname === "/img.png") {
+      imgHits += 1;
+      res.setHeader("content-type", "image/png");
+      res.end(Buffer.from([0x89, 0x50, 0x4E, 0x47]));
+      return;
+    }
+    if (url.pathname === "/page-with-img") {
+      res.end(`<html><body><p class="intro">hello render</p><img src="/img.png"></body></html>`);
+      return;
+    }
     if (url.pathname === "/settle-page") {
       // signal-wait fixture: #r appears only after the /marker XHR lands
       res.end(`<html><body><div id="r" style="display:none">x</div><script>fetch("/marker").then(() => { document.getElementById("r").style.display = "block"; });</script></body></html>`);
@@ -146,6 +157,7 @@ function startServer() {
         server,
         base: "http://127.0.0.1:" + server.address().port,
         slowStats: () => ({ peak: peakSlow }),
+        imgHits: () => imgHits,
       });
     });
   });
@@ -800,4 +812,22 @@ test("settle returns on response+selector without the full timeout", async (t) =
   } finally {
     await browser.close().catch(() => {});
   }
+});
+
+test("render blocks images, keeps extracted text", async (t) => {
+  const { server, base, imgHits } = await startServer();
+  t.after(() => new Promise((res) => server.close(res)));
+  await withHome("renderblock", async () => {
+    const res = await processJob({
+      contract: 1, op: "page", url: base + "/page-with-img",
+      extract: { selector: "p.intro", fields: { text: "" } },
+    });
+    if (!res.ok && /chromium|playwright|launch|browser|executable/i.test(res.error?.message ?? "")) {
+      t.skip("no render browser: " + (res.error?.message ?? "").slice(0, 100));
+      return;
+    }
+    assert.equal(res.ok, true, JSON.stringify(res.error ?? res).slice(0, 200));
+    assert.ok((res.records ?? []).some((r) => (r.text ?? "").includes("hello")));
+    assert.equal(imgHits(), 0, "image was fetched despite blocking");
+  });
 });

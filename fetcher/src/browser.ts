@@ -901,12 +901,39 @@ async function launchContext(browserDir: string, headless = true): Promise<unkno
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
       const chromeBin = findChromeBinary();
-      return await (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
+      const ctx = await (chromium as { launchPersistentContext(d: string, o: Record<string, unknown>): Promise<unknown> })
         .launchPersistentContext(dir, {
           headless,
           executablePath: chromeBin ?? undefined,
           args: ["--disable-blink-features=AutomationControlled", "--disable-features=FedCm,CrossOriginOpenerPolicy"],
         });
+      // Render-only savings: images, media and fonts never affect text
+      // extraction, so abort them at the request edge (bytes + time saved
+      // per page). Login-profile contexts never pass through here - Google
+      // chooser/popup flows are sensitive to blocked subresources.
+      try {
+        await (ctx as {
+          route(u: string, h: (route: {
+            request(): { resourceType(): string };
+            abort(e?: string): Promise<void>;
+            fallback(): Promise<void>;
+          }) => Promise<void>): Promise<void>;
+        }).route("**/*", async (route) => {
+          try {
+            const t = route.request().resourceType();
+            if (t === "image" || t === "media" || t === "font") {
+              await route.abort("blockedbyclient").catch(() => {});
+              return;
+            }
+            await route.fallback().catch(() => {});
+          } catch {
+            /* closed context mid-flight */
+          }
+        });
+      } catch {
+        /* routing unsupported here: renders still work, just untrimmed */
+      }
+      return ctx;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const busy = /user data directory is already in use|profile in use|singleton|process singleton|Opening in existing browser session/i.test(message);
