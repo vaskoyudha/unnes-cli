@@ -19,6 +19,8 @@ function startServer() {
   let tokenCounter = 0;
   let lastToken = "";
   let hits429 = 0;
+  let inflightSlow = 0;
+  let peakSlow = 0;
   const server = createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     const cookie = req.headers.cookie ?? "";
@@ -97,6 +99,17 @@ function startServer() {
       res.end("<html><body>version one</body></html>");
       return;
     }
+    if (url.pathname === "/slow") {
+      // concurrency probe: holds the socket, tracks server-side peak
+      const ms = Math.min(Number(url.searchParams.get("n") ?? "150") || 150, 2000);
+      inflightSlow += 1;
+      peakSlow = Math.max(peakSlow, inflightSlow);
+      setTimeout(() => {
+        inflightSlow -= 1;
+        try { res.end("<html><body>slow fine</body></html>"); } catch { /* client gone */ }
+      }, ms);
+      return;
+    }
     if (url.pathname === "/flaky-429") {
       // rate-limit shape: first hit 429 with Retry-After, then fine
       hits429 += 1;
@@ -120,7 +133,11 @@ function startServer() {
   });
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
-      resolve({ server, base: "http://127.0.0.1:" + server.address().port });
+      resolve({
+        server,
+        base: "http://127.0.0.1:" + server.address().port,
+        slowStats: () => ({ peak: peakSlow }),
+      });
     });
   });
 }
@@ -711,5 +728,38 @@ test("etag validators turn a repeat fetch into 304 notModified", async (t) => {
     assert.equal(second.ok, true);
     assert.equal(second.notModified, true);
     assert.equal(second.status, 304);
+  });
+});
+
+test("mapLimit preserves order and caps concurrency", async () => {
+  const { mapLimit } = await import("../dist/pool.js");
+  let inflight = 0, peak = 0;
+  const out = await mapLimit([1,2,3,4,5,6], 3, async (n) => {
+    inflight++; peak = Math.max(peak, inflight);
+    await new Promise((r) => setTimeout(r, 30));
+    inflight--;
+    return n * 2;
+  });
+  assert.deepEqual(out, [2,4,6,8,10,12]);
+  assert.ok(peak <= 3, "peak " + peak + " exceeds cap");
+  assert.ok(peak >= 2, "no parallelism observed, peak " + peak);
+});
+
+test("batchget concurrency fans out within the cap", async (t) => {
+  const { server, base, slowStats } = await startServer();
+  t.after(() => new Promise((res) => server.close(res)));
+  await withHome("batchconc", async () => {
+    const urls = [1, 2, 3, 4, 5, 6].map((i) => ({ url: base + "/slow?n=150&i=" + i }));
+    const t0 = Date.now();
+    const res = await processJob({ contract: 1, op: "batchget", urls, concurrency: 3 });
+    const dt = Date.now() - t0;
+    assert.equal(res.ok, true);
+    assert.ok(res.results.every((r) => r.ok), JSON.stringify(res).slice(0, 200));
+    // 6x150ms serial sleeps cannot finish under 800ms (timers never fire
+    // early); 2 waves of 3 finish ~300ms + overhead. Peak is the robust
+    // signal, timing corroborates.
+    assert.ok(slowStats().peak <= 3, "peak " + slowStats().peak + " exceeds cap");
+    assert.ok(slowStats().peak >= 2, "no parallelism observed");
+    assert.ok(dt < 800, "6x150ms took " + dt + "ms, still serial?");
   });
 });

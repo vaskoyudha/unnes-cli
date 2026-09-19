@@ -3,6 +3,7 @@ import { pathToFileURL } from "node:url";
 import { CookieJar } from "./cookiejar.js";
 import { HttpFetcher } from "./http.js";
 import { PoliteLimiter } from "./polite.js";
+import { mapLimit } from "./pool.js";
 import { loadValidators, saveValidators } from "./validators.js";
 import { LoginForm, opLogin, opLogout } from "./login.js";
 import { normalizeHtml } from "./normalize.js";
@@ -174,8 +175,11 @@ export async function processJob(job: Job): Promise<JobResult> {
     }
     case "batchget": {
       if (!job.urls || job.urls.length === 0) return fail("usage", "op=batchget requires urls[]");
-      const conc = Math.max(1, Math.floor(job.concurrency ?? 1));
-      if (conc > 1) console.error("[batchget] concurrency>1 ignored until the pool lands (phase 3); running sequentially");
+      // Polite ceiling for one portal: 3 in flight by default (research:
+      // 2-3 concurrent + 1-2s floor for a university host). Single jar
+      // object shared by all workers - safe on one thread (all jar
+      // mutations are synchronous), one limiter shared for the floor.
+      const conc = Math.min(6, Math.max(1, Math.floor(job.concurrency ?? 3)));
       // One jar, one limiter, one save for the whole batch: N URLs for the
       // price of one node spawn, with keep-alive reuse inside the process.
       const polite = new PoliteLimiter();
@@ -195,9 +199,13 @@ export async function processJob(job: Job): Promise<JobResult> {
         };
       };
       const { appForHost } = await import("./sso.js");
-      const results: JobResult[] = [];
-      for (const entry of job.urls) {
-        let r = await runGet(entry);
+      // Pass A: data fetch in parallel. Pass B (below) stays sequential:
+      // an SSO refresh rewrites the jar on disk and our in-memory view must
+      // reload before retrying - concurrent reloads would race.
+      let results = await mapLimit(job.urls, conc, (entry) => runGet(entry));
+      for (let i = 0; i < job.urls.length; i++) {
+        const entry = job.urls[i];
+        let r = results[i];
         // Auto SSO bootstrap per expired entry (same rule as op=get): the
         // refresh rewrites the jar on disk, so reload our in-memory view
         // before retrying - saving the stale view later would clobber it.
@@ -223,7 +231,7 @@ export async function processJob(job: Job): Promise<JobResult> {
               "refresh attempt failed: " + (e instanceof Error ? e.message : String(e)).slice(0, 200);
           }
         }
-        results.push(r);
+        results[i] = r;
       }
       // Same save rule as op=get: skipped only when every entry expired
       // (the jar was rolled back to pre-request state; saving rewrites it).
