@@ -1,15 +1,20 @@
 /**
- * Per-host politeness gate: at most one request burst per host per floor
- * interval, with jitter so concurrent workers don't march in lockstep.
- * A 429/backoff signal pushes the host's next-allowed time into the future
- * (Retry-After honored, capped). Pure logic except the sleep itself.
+ * Per-host politeness gate: serializes bursts per host with an optional
+ * floor, and pushes the host's next-allowed time into the future on
+ * 429/backoff signals (Retry-After honored, capped). Default floor is 0:
+ * this CLI fetches in short bursts (a handful of requests, then idle for
+ * an hour), and the pre-existing behavior was zero inter-request delay -
+ * a 1s default made one batchget run measurably SLOWER than the sequential
+ * status quo (7.7s vs 3.5s for 8 URLs, 2026-09-19). The reactive half
+ * (Retry-After + backoff) is always on; raise the floor explicitly if 429s
+ * ever appear. Pure logic except the sleep itself.
  */
 export class PoliteLimiter {
   private next = new Map<string, number>();
   constructor(private opts: { minDelayMs?: number; rand?: () => number } = {}) {}
 
   private delayMs(): number {
-    const base = this.opts.minDelayMs ?? 1000;
+    const base = this.opts.minDelayMs ?? 0;
     const r = this.opts.rand ? this.opts.rand() : Math.random();
     return Math.round(base * (0.5 + r));
   }
