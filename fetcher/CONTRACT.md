@@ -79,11 +79,15 @@ network | timeout | ratelimit | csrf | login | usage | contract | internal.
   op=get auto-runs it once on session expiry for known app hosts.
 - op=batchget: N plain-HTTP GETs in ONE spawn sharing one jar and one
   per-host politeness limiter (job: `urls: [{url, extract?, extraRegexes?}]`,
-  `concurrency` accepted but sequential until the pool lands). One jar save
-  at the end (skipped only when every entry expired); per-entry SSO
-  bootstrap with jar reload before retry. Top-level `ok` means the op ran;
+  `concurrency`, default 3, clamped to 1-6). Pass A fetches data entries in
+  parallel (order-preserving; one shared jar object is safe on a single
+  thread); pass B stays sequential (SSO bootstrap rewrites the jar on disk,
+  so the in-memory view reloads before retrying). One jar save at the end
+  (skipped only when every entry expired). Top-level `ok` means the op ran;
   per-URL success lives on `results[]`; top `sessionExpired` is true when
-  ANY entry expired (callers reuse the prime-then-retry path).
+  ANY entry expired (callers reuse the prime-then-retry path). Measured
+  2026-09-19, live portal, 8 URLs: 8 sequential spawns 3.50s → batchget
+  sequential 1.98s → batchget conc=3 ~0.94s.
 - Conditional requests: the fetcher keeps per-URL validators
   (`<profile>.validators.json` beside the jar: `{etag, lastModified}`),
   sends If-None-Match/If-Modified-Since, and reports HTTP 304 as
@@ -94,7 +98,11 @@ network | timeout | ratelimit | csrf | login | usage | contract | internal.
 - op=page: render a JS-driven page (Livewire) in the persistent browser session
   and extract records; op=crawl: follow link_selector from a start page and
   extract pageExtract rows per linked page (adds _source/_title). Both sync
-  every *.unnes.ac.id cookie back into the jar.
+  every *.unnes.ac.id cookie back into the jar. Render contexts abort
+  image/media/font requests at the request edge (login-profile contexts
+  never route-block); the Elena handshake waits on signals (`settle()`:
+  login_url response + #btnTest + /my/ landing, all bounded) instead of
+  fixed 5-6s sleeps.
 - No retries/caching/JS rendering for plain HTTP ops - the Rust side drives
   all policy.
 - op=download: binary GET with the jar session (manual redirects, one

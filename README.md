@@ -65,6 +65,12 @@ unnes login opens apps.unnes.ac.id in a headed Chromium window backed by a
 PERSISTENT profile at $UNNES_HOME/browser-profiles/<profile> (0700). Your
 Google account choice and 2FA trust survive between logins, so re-logins after
 the portal's session expiry are one click instead of a full Google re-auth.
+Headless renders (page/crawl/batch/submit/open) use a SEPARATE profile
+<profile>-headless on jar-injected cookies: no background process may open
+the login profile headless (a headless visit burns the kept Google session
+server-side - Google answers with a blank identifier afterwards), and every
+launcher on the login profile pins the same --password-store=basic cookie
+store so the planted session stays readable whoever opens it.
 The portal itself calls auth2.disconnect() after every login, so a Google
 sign-in always happens - the stored profile only makes it easy. Note: this
 profile stores Google session data on disk under UNNES_HOME; it is never
@@ -84,6 +90,8 @@ uploaded or committed (gitignored).
 
 Exit codes: 0 ok, 1 generic, 2 usage, 3 not logged in, 4 session expired,
 5 network/429/challenge, 6 selector matched nothing (page may have changed).
+`status` reports PARTIAL when only Elena is alive; `watch run` marks ERROR
+lines honestly (never "ok") and exits non-zero on page errors.
 
 ## Command reference
 
@@ -108,10 +116,17 @@ examples/config.example.toml (copy to ~/.config/unnes/config.toml and edit).
     unnes data export <page>    full history JSON (--csv: latest state)
     unnes kurikulum             all mata kuliah by semester: LULUS/BERJALAN/BELUM DITEMPUH
     unnes jadwal                weekly class schedule (room/day/time per session)
-    unnes tugas                 Elena assignments/quizzes with deadlines + status
+    unnes tugas [--course=X] [--pending]
+                                Elena assignments/quizzes: course picker + HARUS
+                                DIKUMPULKAN popup (nearest deadline + warnings)
+    unnes materi [--course=X]   Elena course materials (resource/folder/url/page/book)
+    unnes materi download <nama> [--out DIR]
+                                download one material into DIR (default: .)
     unnes tui                   interactive terminal dashboard (ratatui):
-                                tabs Dashboard/Kurikulum/Jadwal/Tugas/Changelog,
-                                keys 1-5/Tab switch, r refresh, q/Esc quit
+                                tabs Dashboard/Kurikulum/Jadwal/Tugas/Changelog/Materi,
+                                keys 1-6/Tab switch, c filter matakuliah,
+                                w deadline popup (Tugas), d download (Materi),
+                                u upload (Tugas), r refresh, q/Esc quit
     unnes changelog [--since=... --page-id=...]
 
 Render/crawl pages in one watch pass share a single browser session (op=batch),
@@ -146,6 +161,23 @@ has its own session exchange:
   sso_semester for Elena; pre_url for semester switches; link_selector turns a
   page into a crawl (follow links, extract rows per linked page, with
   _source/_title columns). Example config lives at ~/.config/unnes/config.toml.
+
+## Fetch performance (measured 2026-09-19, live portal, 8 URLs)
+
+Plain-HTTP course loops used to spawn one `node` per URL. They now go
+through `op=batchget`: one spawn, one jar, one per-host politeness limiter
+(429-honoring, floor opt-in), conditional requests (ETag/304 served from
+cache), and bounded parallelism (default 3, cap 6):
+
+| path | 8 URLs |
+|---|---|
+| 8 sequential `op=get` spawns (before) | 3.50s |
+| 1 `batchget`, sequential (phase 1) | 1.98s |
+| 1 `batchget`, conc=3 (phase 3) | ~0.94s |
+
+Renders additionally skip image/media/font requests and wait on signals
+instead of fixed sleeps. Full `tugas`/`materi` runs still depend on portal
+session state (expired sessions need `unnes login` first).
 
 ## Page discovery (runbook)
 
