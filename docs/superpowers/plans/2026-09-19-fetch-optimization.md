@@ -365,3 +365,9 @@ Plan complete and saved to `docs/superpowers/plans/2026-09-19-fetch-optimization
 **2. Inline Execution** - Execute tasks in this session using executing-plans, batch execution with checkpoints
 
 **Which approach?**
+
+## Phase 2 decision record (Task 5, 2026-09-19, live portal)
+
+- `server.php?wstoken=invalid&wsfunction=core_course_get_updates_since` → `{"exception":"...moodle_exception","errorcode":"invalidtoken","message":"Invalid token - token not found"}`
+- Same endpoint with session cookies and NO token → identical `invalidtoken`.
+- Verdict: Moodle WS requires an admin-provisioned token; session-cookie auth is refused. Delta-first fetching DEFERRED (no token infrastructure will be built). Proceeding with ETag/304 + TTL (Task 6).
